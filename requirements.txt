@@ -1,0 +1,5 @@
+requests
+websockets
+python-dotenv
+httpx
+websocket-client
