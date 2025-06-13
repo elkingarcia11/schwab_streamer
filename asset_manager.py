@@ -82,12 +82,17 @@ class AssetManager:
                 # Finally process signals (without sending emails during initialization)
                 self.process_signals(symbol, timeframe, send_email=False)
         
-        # Send email with initial positions after processing all signals
+        # Collect statistics and send comprehensive bootstrap summary email
         open_positions = []
+        total_transactions = 0
+        
+        # Count open positions and total transactions from CSV files
         for symbol in symbols:
             for timeframe in timeframes:
                 trade_key = f"{symbol}_{timeframe}"
                 inverse_trade_key = f"{symbol}_inverse_{timeframe}"
+                
+                # Check for open positions
                 if self.trades[trade_key] is not None:
                     open_positions.append({
                         'symbol': symbol,
@@ -106,16 +111,46 @@ class AssetManager:
                         'current_price': self.trades[inverse_trade_key]['entry_price'],
                         'entry_time': pd.to_datetime(self.trades[inverse_trade_key]['entry_date'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
                     })
+                
+                # Count transactions from CSV files if they exist
+                try:
+                    trades_file = f"data/trades/{symbol}_{timeframe}_trades.csv"
+                    if os.path.exists(trades_file):
+                        trades_df = pd.read_csv(trades_file)
+                        total_transactions += len(trades_df)
+                    
+                    inverse_trades_file = f"data/trades/{symbol}_inverse_{timeframe}_trades.csv"
+                    if os.path.exists(inverse_trades_file):
+                        inverse_trades_df = pd.read_csv(inverse_trades_file)
+                        total_transactions += len(inverse_trades_df)
+                except Exception as e:
+                    logger.warning(f"Could not count transactions for {symbol}_{timeframe}: {e}")
+        
+        # Calculate total processed combinations
+        total_processed = len(symbols) * len(timeframes) * 2  # Regular + Inverse
+        
+        # Send bootstrap summary email with all the information
+        logger.info(f"📧 Sending bootstrap summary email - {len(symbols)} symbols, {total_processed} combinations, {len(open_positions)} open positions, {total_transactions} transactions")
+        self.email_manager.send_bootstrap_summary_email(
+            symbols=symbols,
+            total_processed=total_processed,
+            open_positions_count=len(open_positions),
+            transaction_count=total_transactions
+        )
+        
+        # Also send detailed open positions email if there are any
         if open_positions:
+            logger.info(f"📧 Sending detailed open positions email for {len(open_positions)} positions")
             self.email_manager.send_open_positions_email(open_positions)
 
-    def process_signals(self, symbol: str, timeframe: str, send_email: bool = True) -> None:
+    def process_signals(self, symbol: str, timeframe: str, send_email: bool = True, process_latest_only: bool = False) -> None:
         """
         Open csv, iterate through each row, check if buy or sell conditions are met, if so, record the action 
         Args:
             symbol (str): The symbol to open a trade for.
             timeframe (str): The timeframe to check indicators on.
             send_email (bool): Whether to send email notifications (default: True)
+            process_latest_only (bool): Whether to only process the latest row (for streaming)
         """
         try:
             # Read the latest data to check indicators
@@ -136,6 +171,18 @@ class AssetManager:
             logger.info(f"Processing signals for {symbol} on {timeframe}")
             logger.info(f"Number of rows in regular data: {len(df)}")
             logger.info(f"Number of rows in inverse data: {len(inverse_df)}")
+
+            if not send_email:
+                logger.info(f"Processing all historical signals without sending emails")
+            elif process_latest_only:
+                logger.info(f"Processing only latest row for streaming updates")
+                # Only process the latest row during streaming to avoid reprocessing all historical data
+                if len(df) > 0:
+                    df = df.tail(1)
+                if len(inverse_df) > 0:
+                    inverse_df = inverse_df.tail(1)
+            else:
+                logger.info(f"Processing signals with email notifications enabled")
 
             # Process regular trades
             for index, row in df.iterrows():
@@ -175,11 +222,13 @@ class AssetManager:
 
                 if has_open_trade and sell_signal:
                     # Close Trade if at least 2 conditions fail
-                    logger.info(f"Closing trade for {symbol} at price {row['close']}")
+                    logger.info(f"🔴 CLOSING trade for {symbol} at price {row['close']} - {conditions_failed}/3 conditions failed")
+                    logger.info(f"   Entry was at: {self.trades[trade_key]['entry_price']}")
+                    logger.info(f"   Trade duration: {row['timestamp'] - self.trades[trade_key]['entry_date']} ms")
                     self.close_trade(symbol, timeframe, row['close'], row['timestamp'], send_email=send_email)
                 elif not has_open_trade and buy_signal:
                     # Open Trade if all conditions are met and no trade is open
-                    logger.info(f"Opening trade for {symbol} at price {row['close']}")
+                    logger.info(f"🟢 OPENING trade for {symbol} at price {row['close']} - All 3 conditions met")
                     self.open_trade(symbol, timeframe, row['close'], row['timestamp'], send_email=send_email)
 
             # Process inverse trades
@@ -219,10 +268,12 @@ class AssetManager:
                 logger.info(f"  Sell Signal: {sell_signal}")
 
                 if has_open_trade and sell_signal:
-                    logger.info(f"Closing inverse trade for {symbol} at price {row['close']}")
+                    logger.info(f"🔴 CLOSING inverse trade for {symbol} at price {row['close']} - {conditions_failed}/3 conditions failed")
+                    logger.info(f"   Entry was at: {self.trades[trade_key]['entry_price']}")
+                    logger.info(f"   Trade duration: {row['timestamp'] - self.trades[trade_key]['entry_date']} ms")
                     self.close_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True, send_email=send_email)
                 elif not has_open_trade and buy_signal:
-                    logger.info(f"Opening inverse trade for {symbol} at price {row['close']}")
+                    logger.info(f"🟢 OPENING inverse trade for {symbol} at price {row['close']} - All 3 conditions met")
                     self.open_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True, send_email=send_email)
         except Exception as e:
             logger.error(f"Error processing signals for {symbol} on {timeframe}: {str(e)}")
@@ -271,19 +322,43 @@ class AssetManager:
                 if not file_exists or os.stat(file_path).st_size == 0:
                     writer.writerow(["symbol", "timeframe", "entry_date", "entry_price", "status"])
                 # Convert entry_date (ms) to ET string for CSV
-                entry_dt = pd.to_datetime(entry_date, unit='ms', utc=True).dt.tz_convert('US/Eastern').dt.strftime('%Y-%m-%d %H:%M:%S') if isinstance(entry_date, (int, float)) else entry_date
-                writer.writerow([symbol, timeframe, entry_dt, entry_price, "open"])
+                entry_dt = pd.to_datetime(entry_date, unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S') if isinstance(entry_date, (int, float)) else entry_date
+                # Add _inverse suffix to symbol for inverse trades
+                symbol_with_suffix = f"{symbol}_inverse" if is_inverse else symbol
+                writer.writerow([symbol_with_suffix, timeframe, entry_dt, entry_price, "open"])
 
             # Send email notification for trade opening only if requested
             if send_email:
                 position_type = "SHORT" if is_inverse else "LONG"
+                
+                # Prepare signal details
+                signal_details = {
+                    'price': entry_price,
+                    'conditions_met': 3,  # All 3 conditions met for opening
+                    'condition_summary': 'All 3 conditions met: ROC8 > 0, EMA7 > VWMA17, MACD Line > MACD Signal',
+                    'timestamp': pd.to_datetime(entry_date, unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                # Get current positions status
+                positions = {}
+                for tf in self.timeframes:
+                    regular_key = f"{symbol}_{tf}"
+                    inverse_key = f"{symbol}_inverse_{tf}"
+                    status = ""
+                    if self.trades.get(regular_key) and self.trades[regular_key].get("status") == "open":
+                        status += "L"
+                    if self.trades.get(inverse_key) and self.trades[inverse_key].get("status") == "open":
+                        status += "S"
+                    positions[tf] = status if status else "None"
+                
                 self.email_manager.send_position_notification(
                     symbol=symbol,
                     period=timeframe,
                     position_type=position_type,
                     action="OPEN",
-                    price=entry_price,
-                    timestamp=entry_date
+                    signal_details=signal_details,
+                    pnl_info=None,
+                    positions=positions
                 )
 
         except Exception as e:
@@ -348,7 +423,9 @@ class AssetManager:
                 writer = csv.writer(f)
                 if not closed_exists or os.stat(closed_file).st_size == 0:
                     writer.writerow(["symbol", "timeframe", "entry_date", "exit_date", "entry_price", "exit_price", "pnl", "pnl_pct"])
-                writer.writerow([symbol, timeframe, entry_dt, exit_dt, trade["entry_price"], trade["exit_price"], trade["pnl"], trade["pnl_pct"]])
+                # Add _inverse suffix to symbol for inverse trades
+                symbol_with_suffix = f"{symbol}_inverse" if is_inverse else symbol
+                writer.writerow([symbol_with_suffix, timeframe, entry_dt, exit_dt, trade["entry_price"], trade["exit_price"], trade["pnl"], trade["pnl_pct"]])
 
             # Update open_trades.csv (overwrite with only open trades, sorted by entry_date ascending)
             open_file = 'data/trades/open_trades.csv'
@@ -357,7 +434,10 @@ class AssetManager:
                 if tval is not None and tval.get("status") == "open":
                     s, tf = tkey.rsplit('_', 1)
                     entry_dt = pd.to_datetime(tval["entry_date"], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S') if isinstance(tval["entry_date"], (int, float)) else tval["entry_date"]
-                    open_trades.append([s, tf, entry_dt, tval["entry_price"], "open", tval["entry_date"]])  # Add raw timestamp for sorting
+                    # Add _inverse suffix to symbol for inverse trades
+                    is_inverse_trade = 'inverse_' in tkey
+                    s_with_suffix = f"{s}_inverse" if is_inverse_trade else s
+                    open_trades.append([s_with_suffix, tf, entry_dt, tval["entry_price"], "open", tval["entry_date"]])  # Add raw timestamp for sorting
             # Sort by raw timestamp (last column)
             open_trades.sort(key=lambda x: x[-1])
             with open(open_file, 'w', newline='') as f:
@@ -369,15 +449,44 @@ class AssetManager:
             # Send email notification for trade closing only if requested
             if send_email:
                 position_type = "SHORT" if is_inverse else "LONG"
+                
+                # Prepare signal details
+                signal_details = {
+                    'price': exit_price,
+                    'conditions_met': 1,  # 2 or more conditions failed for closing
+                    'condition_summary': 'At least 2 conditions failed: Closing position',
+                    'timestamp': pd.to_datetime(exit_date_val, unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                # Prepare P&L info
+                pnl_info = {
+                    'opening_price': trade["entry_price"],
+                    'closing_price': exit_price,
+                    'pnl_dollar': trade["pnl"],
+                    'pnl_percent': trade["pnl_pct"],
+                    'total_pnl': trade["pnl"]  # For now, same as pnl_dollar
+                }
+                
+                # Get current positions status
+                positions = {}
+                for tf in self.timeframes:
+                    regular_key = f"{symbol}_{tf}"
+                    inverse_key = f"{symbol}_inverse_{tf}"
+                    status = ""
+                    if self.trades.get(regular_key) and self.trades[regular_key].get("status") == "open":
+                        status += "L"
+                    if self.trades.get(inverse_key) and self.trades[inverse_key].get("status") == "open":
+                        status += "S"
+                    positions[tf] = status if status else "None"
+                
                 self.email_manager.send_position_notification(
                     symbol=symbol,
                     period=timeframe,
                     position_type=position_type,
                     action="CLOSE",
-                    price=exit_price,
-                    timestamp=exit_date_val,
-                    pnl=trade["pnl"],
-                    pnl_pct=trade["pnl_pct"]
+                    signal_details=signal_details,
+                    pnl_info=pnl_info,
+                    positions=positions
                 )
 
             # Clear the trade from trades dictionary
@@ -528,7 +637,7 @@ class AssetManager:
             
             # Add symbol column if it doesn't exist
             if 'symbol' not in df.columns:
-                df['symbol'] = symbol
+            df['symbol'] = symbol
             
             # Reorder columns
             columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
@@ -938,8 +1047,8 @@ class AssetManager:
                 if success:
                     # Then calculate indicators for both regular and inverse data
                     self.calculate_indicators(symbol, tf)
-                    # Finally process signals (with email notifications during streaming)
-                    self.process_signals(symbol, tf, send_email=True)
+                    # Finally process signals (with email notifications during streaming, latest row only)
+                    self.process_signals(symbol, tf, send_email=True, process_latest_only=True)
                 else:
                     logger.error(f"Failed to aggregate new candle for {symbol} to {tf} timeframe")
 
