@@ -509,12 +509,12 @@ class AssetManager:
 
     def export_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str) -> None:
         """
-        Export data to CSV file.
+        Export DataFrame to CSV file, handling both new files and appending to existing ones.
 
         Args:
             df (pd.DataFrame): The DataFrame to export.
             symbol (str): The equity symbol (e.g., 'AAPL').
-            timeframe (str): The timeframe (e.g., '1m', '5m').
+            timeframe (str): The timeframe of the data (e.g., '1m', '5m', '1h').
         """
         try:
             # Ensure the data directory exists
@@ -528,7 +528,7 @@ class AssetManager:
             
             # Add symbol column if it doesn't exist
             if 'symbol' not in df.columns:
-            df['symbol'] = symbol
+                df['symbol'] = symbol
             
             # Reorder columns
             columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
