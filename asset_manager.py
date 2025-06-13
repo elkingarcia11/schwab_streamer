@@ -322,10 +322,14 @@ class AssetManager:
                 "Authorization": f"Bearer {access_token}"
             }
             
-            # Calculate the last complete minute
+            # Calculate the last complete minute (current minute - 1)
             current_time = pd.Timestamp.now(tz=self.TIMEZONE)
             last_complete_minute = current_time.floor('min') - pd.Timedelta(minutes=1)
             last_complete_timestamp = int(last_complete_minute.timestamp() * 1000)
+            
+            logger.info(f"Current time: {current_time}")
+            logger.info(f"Last complete minute: {last_complete_minute}")
+            logger.info(f"Last complete timestamp: {last_complete_timestamp}")
             
             params = {
                 "symbol": symbol,
@@ -358,16 +362,20 @@ class AssetManager:
 
             # Convert datetime to pandas datetime for filtering
             df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+            df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert(self.TIMEZONE)
+            
+            # Log the datetime range in the data
+            logger.info(f"Data datetime range: {df['datetime'].min()} to {df['datetime'].max()}")
             
             # Filter for market hours (9:30 AM to 3:59 PM ET)
-            df['time'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.time
+            df['time'] = df['datetime'].dt.time
             market_open = pd.to_datetime('09:30:00').time()
             market_close = pd.to_datetime('15:59:00').time()
             
             # Log the time range we're filtering for
             logger.info(f"Filtering for market hours: {market_open} to {market_close}")
             
-            # Log some sample times from the data
+            # Log some sample times from data
             logger.info(f"Sample times from data: {df['time'].head()}")
             
             # Apply market hours filter
@@ -378,8 +386,19 @@ class AssetManager:
             # Drop the temporary time column
             df = df.drop('time', axis=1)
             
+            # Filter out the current minute's data
+            df = df[df['datetime'].dt.floor('min') < current_time.floor('min')]
+            
+            if df.empty:
+                logger.warning(f"No completed candles to save for {symbol}")
+                return None
+                
+            logger.info(f"After filtering current minute: {len(df)} rows")
+            logger.info(f"Final datetime range: {df['datetime'].min()} to {df['datetime'].max()}")
+            
             # Convert back to milliseconds for storage
-            df['datetime'] = df['datetime'].astype('int64') // 10**6
+            df['datetime'] = df['datetime'].dt.tz_convert('UTC').astype('int64') // 10**6
+            df = df.rename(columns={'datetime': 'timestamp'})  # Rename datetime to timestamp
 
             # Create all required data directories
             timeframes = ['1m', '3m', '5m', '10m', '15m', '30m']
@@ -405,64 +424,63 @@ class AssetManager:
 
     def export_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str) -> None:
         """
-        Export the fetched price history data to a CSV file.
+        Export data to CSV file.
 
         Args:
-            df (pd.DataFrame): The price history data to export.
+            df (pd.DataFrame): The DataFrame to export.
             symbol (str): The equity symbol (e.g., 'AAPL').
-            timeframe (str): The timeframe of the data (e.g., '1m', '5m', '1h').
+            timeframe (str): The timeframe (e.g., '1m', '5m').
         """
         try:
-            logger.info(f"Exporting data for {symbol} {timeframe} with {len(df)} rows")
+            # Ensure the data directory exists
+            os.makedirs(f"data/{timeframe}", exist_ok=True)
             
-            # Handle timestamp/datetime from API response
-            if 'datetime' in df.columns:
-                # The API's 'datetime' field is in milliseconds since epoch
-                df['timestamp'] = df['datetime'].astype(int)  # Store original timestamp
-                # Convert to ET timezone and format as string
-                dt_col = pd.to_datetime(df['datetime'], unit='ms')
-                # Handle timezone conversion properly
-                if dt_col.dt.tz is None:
-                    dt_col = dt_col.dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
-                else:
-                    dt_col = dt_col.dt.tz_convert('US/Eastern')
-                df['datetime'] = dt_col.dt.strftime('%Y-%m-%d %H:%M:%S')
+            # Convert timestamp to datetime in ET
+            if 'timestamp' in df.columns:
+                df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+                df['datetime'] = df['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Add symbol column
-            df['symbol'] = symbol
+            # Add symbol column if it doesn't exist
+            if 'symbol' not in df.columns:
+                df['symbol'] = symbol
             
-            # Ensure all required columns exist
-            required_columns = ['open', 'high', 'low', 'close', 'volume']
-            for col in required_columns:
-                if col not in df.columns:
-                    logger.warning(f"Warning: Column '{col}' not found in data")
-                    df[col] = None
-            
-            # Reorder columns to have timestamp first, followed by datetime and other columns
+            # Reorder columns
             columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
             df = df[columns]
             
-            # Create all required data directories
-            timeframes = ['1m', '3m', '5m', '10m', '15m', '30m']
-            for tf in timeframes:
-                os.makedirs(f"data/{tf}", exist_ok=True)
-            
-            # Define the target file path
+            # Save to CSV
             target_path = f"data/{timeframe}/{symbol}.csv"
             
-            # Export to CSV
-            df.to_csv(target_path, index=False)
-            logger.info(f"Data exported to {target_path}")
-            logger.info(f"Filtered data points: {len(df)} rows")
-            
-            # Verify the file was created and has content
+            # Check if file exists
             if os.path.exists(target_path):
-                file_size = os.path.getsize(target_path)
-                logger.info(f"File size: {file_size} bytes")
-                if file_size == 0:
-                    logger.error(f"Warning: File {target_path} is empty")
+                # Read existing data
+                existing_df = pd.read_csv(target_path)
+                
+                # Convert timestamp to int for comparison
+                existing_df['timestamp'] = existing_df['timestamp'].astype(int)
+                df['timestamp'] = df['timestamp'].astype(int)
+                
+                # Get the last timestamp from existing data
+                last_timestamp = existing_df['timestamp'].max()
+                
+                # Only keep new candles with timestamps greater than the last timestamp
+                df = df[df['timestamp'] > last_timestamp]
+                
+                if not df.empty:
+                    # Concatenate existing and new data
+                    df = pd.concat([existing_df, df], ignore_index=True)
+                    
+                    # Sort by timestamp
+                    df = df.sort_values('timestamp')
+                    
+                    # Save to CSV
+                    df.to_csv(target_path, index=False)
+                    logger.info(f"Successfully appended {len(df) - len(existing_df)} new candles to {target_path}")
             else:
-                logger.error(f"Error: File {target_path} was not created")
+                # If file doesn't exist, just save the new data
+                df.to_csv(target_path, index=False)
+                logger.info(f"Successfully created new file {target_path} with {len(df)} candles")
             
         except Exception as e:
             logger.error(f"Error exporting data to CSV for {symbol} {timeframe}: {str(e)}")
@@ -595,7 +613,7 @@ class AssetManager:
             for col in ohlc_columns:
                 df_inverse[col] = 1 / df_inverse[col]
             
-            # Save inverse aggregated data
+            # Save inverse aggregated data with correct naming
             inverse_path = f"data/{target_timeframe}/{symbol}_inverse.csv"
             df_inverse.to_csv(inverse_path, index=False)
             logger.info(f"Inverse aggregated data exported to {inverse_path}")
@@ -712,75 +730,90 @@ class AssetManager:
         market_close = df['datetime'].dt.time <= pd.to_datetime('15:59:00').time()
         return df[market_open & market_close]
 
-    def aggregate_new_candle(self, symbol: str, candle: Dict[str, Any], source_timeframe: str, target_timeframe: str) -> bool:
+    def aggregate_new_candle(self, symbol: str, candle: dict, source_timeframe: str, target_timeframe: str) -> bool:
         """
-        Efficiently aggregates a new candle to a higher timeframe without reprocessing the entire file.
-        Returns True if the timeframe was updated, False otherwise.
+        Aggregate a new candle from source timeframe to target timeframe.
+
+        Args:
+            symbol (str): The equity symbol (e.g., 'AAPL').
+            candle (dict): The new candle data.
+            source_timeframe (str): The source timeframe (e.g., '1m', '5m').
+            target_timeframe (str): The target timeframe (e.g., '5m', '15m').
+
+        Returns:
+            bool: True if the aggregation was successful, False otherwise.
         """
         try:
+            # Create a DataFrame from the new candle
+            new_candle_df = pd.DataFrame([candle])
+            
             # Read existing data
             source_path = f"data/{source_timeframe}/{symbol}.csv"
+            if not os.path.exists(source_path):
+                logger.error(f"Error: Source file {source_path} does not exist")
+                return False
+                
+            df = pd.read_csv(source_path)
+            
+            # Append new candle
+            df = pd.concat([df, new_candle_df], ignore_index=True)
+            
+            # Convert datetime to pandas datetime
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            
+            # Parse target_timeframe to minutes
+            if target_timeframe.endswith('m'):
+                target_minutes = int(target_timeframe.replace('m', ''))
+            elif target_timeframe.endswith('h'):
+                target_minutes = int(target_timeframe.replace('h', '')) * 60
+            else:
+                raise ValueError(f"Unsupported timeframe format: {target_timeframe}")
+            
+            # Create a resampling rule using 'min' instead of 'T'
+            rule = f"{target_minutes}min"
+            
+            # Group by the new timeframe
+            grouped = df.groupby(pd.Grouper(key='datetime', freq=rule))
+            
+            # Aggregate the data
+            agg_df = grouped.agg({
+                'timestamp': 'first',    # Keep the first timestamp
+                'symbol': 'first',       # Keep the symbol
+                'open': 'first',         # First price in the period
+                'high': 'max',           # Highest price in the period
+                'low': 'min',            # Lowest price in the period
+                'close': 'last',         # Last price in the period
+                'volume': 'sum'          # Sum of volume in the period
+            }).reset_index()
+            
+            # Drop any rows with NaN values (incomplete periods)
+            agg_df = agg_df.dropna()
+            
+            # Convert datetime back to string format
+            agg_df['datetime'] = agg_df['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Reorder columns
+            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
+            agg_df = agg_df[columns]
+            
+            # Save regular aggregated data
             target_path = f"data/{target_timeframe}/{symbol}.csv"
+            agg_df.to_csv(target_path, index=False)
             
-            if not os.path.exists(source_path) or not os.path.exists(target_path):
-                logger.error(f"Source or target file does not exist for {symbol}")
-                return False
-
-            # Read existing data
-            source_df = pd.read_csv(source_path)
-            target_df = pd.read_csv(target_path)
+            # Generate inverse OHLC data
+            df_inverse = agg_df.copy()
+            ohlc_columns = ['open', 'high', 'low', 'close']
+            for col in ohlc_columns:
+                df_inverse[col] = 1 / df_inverse[col]
             
-            # Convert timestamp to datetime
-            candle_time = pd.to_datetime(candle['timestamp'], unit='ms')
+            # Save inverse aggregated data with correct naming
+            inverse_path = f"data/{target_timeframe}/{symbol}_inverse.csv"
+            df_inverse.to_csv(inverse_path, index=False)
             
-            # Determine the target timeframe's period
-            if target_timeframe == '3m':
-                period = '3T'
-            elif target_timeframe == '5m':
-                period = '5T'
-            elif target_timeframe == '10m':
-                period = '10T'
-            elif target_timeframe == '15m':
-                period = '15T'
-            elif target_timeframe == '30m':
-                period = '30T'
-            else:
-                logger.error(f"Unsupported target timeframe: {target_timeframe}")
-                return False
-
-            # Get the period start time for the new candle
-            period_start = candle_time.floor(period)
-            
-            # Check if we need to update an existing candle or create a new one
-            mask = target_df['timestamp'] == period_start.timestamp() * 1000
-            if mask.any():
-                # Update existing candle
-                idx = mask.idxmax()
-                target_df.loc[idx, 'open'] = candle['open']
-                target_df.loc[idx, 'high'] = max(target_df.loc[idx, 'high'], candle['high'])
-                target_df.loc[idx, 'low'] = min(target_df.loc[idx, 'low'], candle['low'])
-                target_df.loc[idx, 'close'] = candle['close']
-                target_df.loc[idx, 'volume'] += candle['volume']
-            else:
-                # Create new candle
-                new_candle = {
-                    'timestamp': int(period_start.timestamp() * 1000),
-                    'open': candle['open'],
-                    'high': candle['high'],
-                    'low': candle['low'],
-                    'close': candle['close'],
-                    'volume': candle['volume']
-                }
-                target_df = pd.concat([target_df, pd.DataFrame([new_candle])], ignore_index=True)
-                target_df = target_df.sort_values('timestamp')
-
-            # Save updated data
-            target_df.to_csv(target_path, index=False)
-            logger.info(f"Successfully aggregated new candle for {symbol} from {source_timeframe} to {target_timeframe}")
             return True
-
+            
         except Exception as e:
-            logger.error(f"Error aggregating new candle for {symbol}: {str(e)}")
+            logger.error(f"Error aggregating new candle for {symbol} from {source_timeframe} to {target_timeframe}: {str(e)}")
             return False
 
     def calculate_latest_indicators(self, symbol: str, timeframe: str, new_candle: Dict[str, Any]) -> None:
@@ -830,272 +863,236 @@ class AssetManager:
 
     def process_latest_signals(self, symbol: str, timeframe: str) -> None:
         """
-        Process latest signals for a symbol and timeframe
+        Process the latest signals for a symbol and timeframe.
+
+        Args:
+            symbol (str): The equity symbol (e.g., 'AAPL').
+            timeframe (str): The timeframe (e.g., '1m', '5m').
         """
         try:
-            # Read the latest data to check indicators
+            # Read the latest data
             data_path = f"data/{timeframe}/{symbol}.csv"
             if not os.path.exists(data_path):
                 logger.error(f"Data file {data_path} does not exist")
                 return
-
-            inverse_data_path = f"data/{timeframe}/{symbol}_inverse.csv"
-            if not os.path.exists(inverse_data_path):
-                logger.error(f"Inverse data file {inverse_data_path} does not exist")
-                return
-
-            # Read the data
+                
             df = pd.read_csv(data_path)
-            inverse_df = pd.read_csv(inverse_data_path)
-
-            if len(df) == 0 or len(inverse_df) == 0:
-                logger.error(f"No data available for {symbol} on {timeframe}")
+            if df.empty:
+                logger.warning(f"No data available for {symbol} {timeframe}")
                 return
-
+                
             # Get the latest row
             latest_row = df.iloc[-1]
-            latest_inverse_row = inverse_df.iloc[-1]
-
-            # Process regular trades
-            trade_key = f"{symbol}_{timeframe}"
-            has_open_trade = self.trades[trade_key] is not None
-
-            # Check if any required indicators are NaN
+            
+            # Check if we have all required indicators
             if not any(pd.isna(latest_row[col]) for col in ['roc8', 'ema7', 'vwma17', 'macd_line', 'macd_signal']):
-                # Check technical conditions
+                # Check for long entry conditions
                 conditions_met = (
                     latest_row['roc8'] > 0 and
                     latest_row['ema7'] > latest_row['vwma17'] and
                     latest_row['macd_line'] > latest_row['macd_signal']
                 )
-
+                
+                # Get current trade status
+                trade_key = f"{symbol}_{timeframe}"
+                has_open_trade = self.trades[trade_key] is not None
+                
+                # Process long signals
                 if has_open_trade and not conditions_met:
-                    # Close Trade if conditions are no longer met
                     close_price = latest_row['close']
-                    logger.info(f"Closing trade for {symbol} at price {close_price}")
                     self.close_trade(symbol, timeframe, close_price, latest_row['timestamp'])
+                    logger.info(f"Closed long trade for {symbol} at {close_price}")
                     
-                    # Send email notification for closing trade
-                    position_type = "LONG"
-                    signal_details = {
-                        'price': close_price,
-                        'conditions_met': 0,
-                        'condition_summary': 'Exit conditions met',
-                        'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    pnl_info = {
-                        'opening_price': self.trades[trade_key]['entry_price'],
-                        'closing_price': close_price,
-                        'pnl_dollar': close_price - self.trades[trade_key]['entry_price'],
-                        'pnl_percent': ((close_price - self.trades[trade_key]['entry_price']) / self.trades[trade_key]['entry_price']) * 100,
-                        'total_pnl': close_price - self.trades[trade_key]['entry_price']
-                    }
+                    # Update positions for email
                     positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
+                    
+                    # Send email notification
                     self.email_manager.send_position_notification(
                         symbol=symbol,
                         period=timeframe,
-                        position_type=position_type,
-                        action='CLOSE',
-                        signal_details=signal_details,
-                        pnl_info=pnl_info,
+                        position_type="LONG",
+                        action="CLOSE",
+                        signal_details={
+                            'price': close_price,
+                            'conditions_met': 0,
+                            'condition_summary': 'Exit conditions met',
+                            'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                        },
+                        pnl_info={
+                            'opening_price': self.trades[trade_key]['entry_price'],
+                            'closing_price': close_price,
+                            'pnl_dollar': close_price - self.trades[trade_key]['entry_price'],
+                            'pnl_percent': ((close_price - self.trades[trade_key]['entry_price']) / self.trades[trade_key]['entry_price']) * 100,
+                            'total_pnl': close_price - self.trades[trade_key]['entry_price']
+                        },
                         positions=positions
                     )
                 elif not has_open_trade and conditions_met:
-                    # Open Trade if conditions are met and no trade is open
                     entry_price = latest_row['close']
-                    logger.info(f"Opening trade for {symbol} at price {entry_price}")
                     self.open_trade(symbol, timeframe, entry_price, latest_row['timestamp'])
+                    logger.info(f"Opened long trade for {symbol} at {entry_price}")
                     
-                    # Send email notification for opening trade
-                    position_type = "LONG"
-                    signal_details = {
-                        'price': entry_price,
-                        'conditions_met': 3,
-                        'condition_summary': 'All conditions met',
-                        'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                    }
+                    # Update positions for email
                     positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
+                    
+                    # Send email notification
                     self.email_manager.send_position_notification(
                         symbol=symbol,
                         period=timeframe,
-                        position_type=position_type,
-                        action='OPEN',
-                        signal_details=signal_details,
+                        position_type="LONG",
+                        action="OPEN",
+                        signal_details={
+                            'price': entry_price,
+                            'conditions_met': 3,
+                            'condition_summary': 'All conditions met',
+                            'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                        },
                         pnl_info=None,
                         positions=positions
                     )
-
-            # Process inverse trades
-            inverse_trade_key = f"{symbol}_inverse_{timeframe}"
-            has_open_inverse_trade = self.trades[inverse_trade_key] is not None
-
-            # Check if any required indicators are NaN
+            
+            # Process inverse signals
+            inverse_data_path = f"data/{timeframe}/{symbol}_inverse.csv"
+            if not os.path.exists(inverse_data_path):
+                logger.error(f"Inverse data file {inverse_data_path} does not exist")
+                return
+                
+            inverse_df = pd.read_csv(inverse_data_path)
+            if inverse_df.empty:
+                logger.warning(f"No inverse data available for {symbol} {timeframe}")
+                return
+                
+            latest_inverse_row = inverse_df.iloc[-1]
+            
+            # Check if we have all required indicators for inverse
             if not any(pd.isna(latest_inverse_row[col]) for col in ['roc8', 'ema7', 'vwma17', 'macd_line', 'macd_signal']):
-                # Use the same technical conditions for inverse trades (not inverted)
+                # Check for inverse entry conditions
                 conditions_met = (
                     latest_inverse_row['roc8'] > 0 and
                     latest_inverse_row['ema7'] > latest_inverse_row['vwma17'] and
                     latest_inverse_row['macd_line'] > latest_inverse_row['macd_signal']
                 )
-
+                
+                # Get current inverse trade status
+                inverse_trade_key = f"{symbol}_inverse_{timeframe}"
+                has_open_inverse_trade = self.trades[inverse_trade_key] is not None
+                
+                # Process inverse signals
                 if has_open_inverse_trade and not conditions_met:
                     close_price = latest_inverse_row['close']
-                    logger.info(f"Closing inverse trade for {symbol} at price {close_price}")
                     self.close_trade(symbol, timeframe, close_price, latest_inverse_row['timestamp'], is_inverse=True)
+                    logger.info(f"Closed inverse trade for {symbol} at {close_price}")
                     
-                    # Send email notification for closing inverse trade
-                    position_type = "SHORT"
-                    signal_details = {
-                        'price': close_price,
-                        'conditions_met': 0,
-                        'condition_summary': 'Exit conditions met',
-                        'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    pnl_info = {
-                        'opening_price': self.trades[inverse_trade_key]['entry_price'],
-                        'closing_price': close_price,
-                        'pnl_dollar': close_price - self.trades[inverse_trade_key]['entry_price'],
-                        'pnl_percent': ((close_price - self.trades[inverse_trade_key]['entry_price']) / self.trades[inverse_trade_key]['entry_price']) * 100,
-                        'total_pnl': close_price - self.trades[inverse_trade_key]['entry_price']
-                    }
+                    # Update positions for email
                     positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
+                    
+                    # Send email notification
                     self.email_manager.send_position_notification(
                         symbol=symbol,
                         period=timeframe,
-                        position_type=position_type,
-                        action='CLOSE',
-                        signal_details=signal_details,
-                        pnl_info=pnl_info,
-                        positions=positions
+                        position_type="SHORT",
+                        action="CLOSE",
+                        signal_details={
+                            'price': close_price,
+                            'conditions_met': 0,
+                            'condition_summary': 'Exit conditions met',
+                            'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                        },
+                        pnl_info={
+                            'opening_price': self.trades[inverse_trade_key]['entry_price'],
+                            'closing_price': close_price,
+                            'pnl_dollar': close_price - self.trades[inverse_trade_key]['entry_price'],
+                            'pnl_percent': ((close_price - self.trades[inverse_trade_key]['entry_price']) / self.trades[inverse_trade_key]['entry_price']) * 100,
+                            'total_pnl': close_price - self.trades[inverse_trade_key]['entry_price']
+                        },
+                        positions=positions,
+                        is_inverse=True
                     )
                 elif not has_open_inverse_trade and conditions_met:
                     entry_price = latest_inverse_row['close']
-                    logger.info(f"Opening inverse trade for {symbol} at price {entry_price}")
                     self.open_trade(symbol, timeframe, entry_price, latest_inverse_row['timestamp'], is_inverse=True)
+                    logger.info(f"Opened inverse trade for {symbol} at {entry_price}")
                     
-                    # Send email notification for opening inverse trade
-                    position_type = "SHORT"
-                    signal_details = {
-                        'price': entry_price,
-                        'conditions_met': 3,
-                        'condition_summary': 'All conditions met',
-                        'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                    }
+                    # Update positions for email
                     positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
+                    
+                    # Send email notification
                     self.email_manager.send_position_notification(
                         symbol=symbol,
                         period=timeframe,
-                        position_type=position_type,
-                        action='OPEN',
-                        signal_details=signal_details,
+                        position_type="SHORT",
+                        action="OPEN",
+                        signal_details={
+                            'price': entry_price,
+                            'conditions_met': 3,
+                            'condition_summary': 'All conditions met',
+                            'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
+                        },
                         pnl_info=None,
-                        positions=positions
+                        positions=positions,
+                        is_inverse=True
                     )
-
+                    
         except Exception as e:
-            logger.error(f"Error processing latest signals for {symbol} on {timeframe}: {str(e)}")
+            logger.error(f"Error processing latest signals for {symbol} {timeframe}: {str(e)}")
 
-    def add_new_candle(self, symbol: str, candle: Dict[str, Any]) -> None:
+    def add_new_candle(self, symbol: str, candle: dict) -> None:
         """
-        Adds a new candle's OHLCV data to both regular and inverse 1-minute timeframes,
-        efficiently aggregates to higher timeframes, calculates indicators for the latest candle,
-        and processes signals for the latest entry only for timeframes that were updated.
+        Add a new candle to the data and update all timeframes.
+        Only processes candles that are from the last complete minute.
+
+        Args:
+            symbol (str): The symbol to add the candle for.
+            candle (dict): The candle data to add.
         """
         try:
-            # Create inverse candle data
-            inverse_candle = {
-                'timestamp': candle['timestamp'],
-                'open': 1 / candle['open'],
-                'high': 1 / candle['low'],  # Note: high/low are inverted
-                'low': 1 / candle['high'],  # Note: high/low are inverted
-                'close': 1 / candle['close'],
-                'volume': candle['volume']
-            }
-
-            # Add the new candle to both regular and inverse 1-minute timeframes
+            # Convert timestamp to datetime for comparison
+            candle_time = pd.Timestamp(candle['timestamp'], unit='ms', tz='UTC')
+            current_time = pd.Timestamp.now(tz='UTC')
+            
+            # Only process if the candle is from the last complete minute
+            last_complete_minute = current_time.floor('min') - pd.Timedelta(minutes=1)
+            if candle_time.floor('min') >= current_time.floor('min'):
+                logger.info(f"Skipping incomplete candle for {symbol} at {candle_time}")
+                return
+            
+            # Add the new candle to the 1-minute data
             self.export_to_csv(pd.DataFrame([candle]), symbol, "1m")
-            self.export_to_csv(pd.DataFrame([inverse_candle]), f"{symbol}_inverse", "1m")
-
-            # Track which timeframes were updated
-            updated_timeframes = {"1m"}  # Always include 1m as it's always updated
-
-            # Efficiently aggregate to higher timeframes for both regular and inverse
-            for timeframe in self.timeframes:
-                if timeframe != "1m":
-                    # Check if we need to update this timeframe
-                    regular_updated = self.aggregate_new_candle(symbol, candle, "1m", timeframe)
-                    inverse_updated = self.aggregate_new_candle(f"{symbol}_inverse", inverse_candle, "1m", timeframe)
-                    
-                    if regular_updated or inverse_updated:
-                        updated_timeframes.add(timeframe)
-
-            # Calculate indicators and process signals only for updated timeframes
-            for timeframe in updated_timeframes:
-                # Calculate for regular data
-                self.calculate_latest_indicators(symbol, timeframe, candle)
-                # Calculate for inverse data
-                self.calculate_latest_indicators(f"{symbol}_inverse", timeframe, inverse_candle)
-                # Process regular signals
-                self.process_latest_signals(symbol, timeframe)
-                # Process inverse signals
-                self.process_latest_signals(f"{symbol}_inverse", timeframe)
-
+            
+            # Update all other timeframes
+            for tf in self.timeframes:
+                self.aggregate_new_candle(symbol, candle, "1m", tf)
+                self.generate_inverse_ohlc(symbol, tf)
+                self.calculate_latest_indicators(symbol, tf, candle)
+                self.process_latest_signals(symbol, tf)
+                
         except Exception as e:
             logger.error(f"Error adding new candle for {symbol}: {str(e)}")
 
-def main():
-    # Define symbols and timeframes
-    symbols = ["AAPL", "SPY", "QQQ", "TSLA", "NVDA", "AMZN", "META", "MSFT"]
-    timeframes = ["3m", "5m","10m", "15m", "30m"]
-    
-    # Create a SchwabAuth instance
-    auth = SchwabAuth()
-    
-    #Get 9:30am ET in current timezone
-    start_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=9, minute=30, second=0, microsecond=0)
-    print(start_time)
-    #Get 4:00pm ET in current timezone
-    end_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=16, minute=0, second=0, microsecond=0)    
-    print(end_time)
-    # Get 9:30am ET in epoch milliseconds
-    start_date = int(start_time.timestamp() * 1000)
-    # Get 4:00pm ET in epoch milliseconds
-    end_date = int(end_time.timestamp() * 1000)
-    
-    logger.info(f"Fetching data from {pd.Timestamp(start_date, unit='ms', tz='US/Eastern')} to {pd.Timestamp(end_date, unit='ms', tz='US/Eastern')}")
-    # Repeat this every minute
-    while True:
-        AssetManager(auth, symbols, timeframes, start_date, end_date)
-        # Read current and previous open trades
-        open_trades = pd.read_csv('data/trades/open_trades.csv')
-        prev_path = 'data/trades/prev_open_trades.csv'
-        if os.path.exists(prev_path):
-            prev_open_trades = pd.read_csv(prev_path)
-        else:
-            prev_open_trades = pd.DataFrame(columns=open_trades.columns)
-        # Find new open trades
-        merged = open_trades.merge(prev_open_trades, how='left', indicator=True)
-        new_trades = merged[merged['_merge'] == 'left_only'].drop('_merge', axis=1)
-        if not new_trades.empty:
-            # Prepare last 5 new open trades for email
-            last5 = new_trades.tail(5)
-            open_positions = []
-            for _, row in last5.iterrows():
-                open_positions.append({
-                    'symbol': row['symbol'],
-                    'timeframe': row['timeframe'],
-                    'entry_price': float(row['entry_price']),
-                    'current_price': float(row['entry_price']),
-                    'entry_time': row['entry_date'],
-                    'option_type': 'EQUITY',
-                    'option_symbol': 'N/A',
-                    'strike_price': 0,
-                    'expiry_date': 'N/A'
-                })
-            self.email_manager.send_open_positions_email(open_positions)
-        # Overwrite prev_open_trades.csv with current open_trades
-        open_trades.to_csv(prev_path, index=False)
-        time.sleep(60)
+    def read_inverse_data(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """
+        Read inverse OHLC data for a symbol and timeframe.
 
-if __name__ == "__main__":
-    main()  
+        Args:
+            symbol (str): The equity symbol (e.g., 'AAPL').
+            timeframe (str): The timeframe (e.g., '1m', '5m').
+
+        Returns:
+            pd.DataFrame: DataFrame containing inverse OHLC data.
+        """
+        try:
+            # Ensure the data directory exists
+            os.makedirs(f"data/{timeframe}", exist_ok=True)
+            
+            # Read the inverse data file
+            inverse_path = f"data/{timeframe}/{symbol}_inverse.csv"
+            if not os.path.exists(inverse_path):
+                logger.error(f"Inverse data file {inverse_path} does not exist, fix it for all time frames")
+                return pd.DataFrame()
+                
+            df = pd.read_csv(inverse_path)
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error reading inverse data for {symbol} {timeframe}: {str(e)}")
+            return pd.DataFrame()

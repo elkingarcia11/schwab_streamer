@@ -8,6 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, Optional
+import time
 
 class EmailManager:
     def __init__(self):
@@ -17,6 +18,7 @@ class EmailManager:
         self.recipients = []
         self.smtp_server = "smtp.gmail.com"
         self.smtp_port = 587
+        self.last_open_positions_email = 0  # Track last email timestamp
         
         self._load_credentials()
     
@@ -514,14 +516,20 @@ Happy trading! 📈📉
             return True  # No positions to report
         
         try:
+            # Check if we've sent an email in the last minute
+            current_time = time.time()
+            if current_time - self.last_open_positions_email < 60:  # 60 seconds = 1 minute
+                return True  # Skip sending if less than a minute has passed
+            
             subject = f"📈 Open Positions Report - {len(open_positions)} Active"
             
             body = f"""📋 CURRENT OPEN POSITIONS REPORT
 
-You currently have {len(open_positions)} active positions from the bootstrap initialization:
+You currently have {len(open_positions)} active positions:
 
 """
             
+            # List all positions in a single list
             for i, position in enumerate(open_positions, 1):
                 symbol = position.get('symbol', 'Unknown')
                 timeframe = position.get('timeframe', 'Unknown')
@@ -540,12 +548,13 @@ You currently have {len(open_positions)} active positions from the bootstrap ini
                     pnl_text = "Calculating..."
                 
                 body += f"""🔹 Position #{i}:
-   Symbol: {symbol} ({timeframe} timeframe)
+   Symbol: {symbol}
+   Timeframe: {timeframe}
    Type: {position_type}
    Entry Price: ${entry_price:.2f}
    Current Price: ${current_price:.2f}
    Unrealized P&L: {pnl_text}
-   Entry Time: {entry_time} 
+   Entry Time: {entry_time}
 
 """
             
@@ -561,8 +570,11 @@ You currently have {len(open_positions)} active positions from the bootstrap ini
 
 ⚠️ Monitor your positions and ensure you have sufficient account balance.
 
-This is an automated report from your trading system bootstrap.
+This is an automated report from your trading system.
 """
+            
+            # Update last email timestamp
+            self.last_open_positions_email = current_time
             
             return self._send_email(subject, body)
             

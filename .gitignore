@@ -11,3 +11,4 @@ schwab_refresh_token.txt
 schwab_access_token.txt
 */__pycache__/
 *.log
+data/
