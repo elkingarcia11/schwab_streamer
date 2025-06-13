@@ -3,3 +3,7 @@ websockets
 python-dotenv
 httpx
 websocket-client
+pandas
+pandas-ta
+setuptools
+numpy==1.24.4

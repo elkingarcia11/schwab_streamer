@@ -41,10 +41,21 @@ class SchwabStreamerClient:
         end_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=16, minute=0, second=0, microsecond=0)    
         print(end_time)
         # Get 9:30am ET in epoch milliseconds
-        start_date = int(start_time.timestamp() * 1000)
+        self.start_date = int(start_time.timestamp() * 1000)
         # Get 4:00pm ET in epoch milliseconds
-        end_date = int(end_time.timestamp() * 1000)
+        self.end_date = int(end_time.timestamp() * 1000)
         self.asset_manager = AssetManager(self.auth, self.tracked_symbols, self.timeframes, self.start_date, self.end_date)
+        
+        # Get user preferences and store SchwabClientCustomerId
+        self.user_preferences = self.get_user_preferences()
+        if not self.user_preferences or 'streamerInfo' not in self.user_preferences:
+            raise Exception("Could not get user preferences")
+        
+        # Store streamer info
+        self.streamer_info = self.user_preferences['streamerInfo'][0]
+        self.schwab_client_customer_id = self.streamer_info.get('schwabClientCustomerId')
+        if not self.schwab_client_customer_id:
+            raise Exception("Could not get SchwabClientCustomerId from user preferences")
         
         # Actual CHART_EQUITY field mappings based on observed raw data
         # Fields 2-6 are OHLCV (Open, High, Low, Close, Volume) and field 7 is timestamp
@@ -104,46 +115,38 @@ class SchwabStreamerClient:
 
     def parse_chart_data(self, content_item: dict) -> dict:
         """Parse CHART_EQUITY message content using field mappings"""
-        parsed = {}
-        
-        for field_id, value in content_item.items():
-            if field_id == 'key':
-                parsed['symbol'] = value
-            elif field_id.isdigit():
-                field_num = int(field_id)
-                field_name = self.chart_equity_fields.get(field_num, f'field_{field_num}')
-                parsed[field_name] = value
-            else:
-                parsed[field_id] = value
-                
-        return parsed
+        try:
+            # Extract the fields array from the content
+            fields = content_item.get('fields', [])
+            if not fields or len(fields) < 9:  # We expect at least 9 fields
+                return None
+
+            # Map the fields according to the Schwab API specification
+            parsed = {
+                'symbol': fields[0],          # key - Ticker symbol
+                'sequence': fields[1],        # sequence - Identifies the candle minute
+                'open': float(fields[2]),     # Open Price
+                'high': float(fields[3]),     # High Price
+                'low': float(fields[4]),      # Low Price
+                'close': float(fields[5]),    # Close Price
+                'volume': float(fields[6]),   # Volume
+                'time': int(fields[7]),       # Chart Time (milliseconds since Epoch)
+                'chart_day': int(fields[8])   # Chart Day
+            }
+
+            return parsed
+
+        except Exception as e:
+            print(f"❌ Error parsing CHART_EQUITY data: {e}")
+            return None
 
     def on_message(self, ws, message):
         """Handle WebSocket messages"""
         try:
             data = json.loads(message)
             
-            # Always show raw data for CHART_EQUITY messages
-            if isinstance(data, dict) and "data" in data:
-                for data_item in data["data"]:
-                    service = data_item.get("service")
-                    if service == "CHART_EQUITY":
-                        print(f"\n🔍 RAW CHART_EQUITY DATA:")
-                        print(f"   Service: {service}")
-                        print(f"   Timestamp: {data_item.get('timestamp')}")
-                        print(f"   Content: {data_item.get('content', [])}")
-                        print(f"   Raw JSON: {json.dumps(data_item, indent=2)}")
-                        print("-" * 80)
-                    elif service == "LEVELONE_OPTIONS":
-                        print(f"\n🔍 RAW LEVELONE_OPTIONS DATA:")
-                        print(f"   Service: {service}")
-                        print(f"   Timestamp: {data_item.get('timestamp')}")
-                        print(f"   Content: {data_item.get('content', [])}")
-                        print(f"   Raw JSON: {json.dumps(data_item, indent=2)}")
-                        print("-" * 80)
-            
             if self.debug:
-                print(f"📨 Full Raw Message: {json.dumps(data, indent=2)}")
+                print(f"📨 Received message: {json.dumps(data, indent=2)}")
             
             # Handle different message types
             if isinstance(data, dict):
@@ -160,9 +163,13 @@ class SchwabStreamerClient:
                                 status = msg.split("status=")[1].split(";")[0] if ";" in msg else msg.split("status=")[1]
                                 print(f"📊 Account status: {status}")
                             self.connected = True
+                            # Subscribe to symbols after successful login
+                            print("📊 Subscribing to symbols...")
+                            self.subscribe_chart_data(self.tracked_symbols)
                         else:
                             print(f"❌ WebSocket login failed with code: {code}")
                             print(f"   Message: {content.get('msg', 'Unknown error')}")
+                            self.connected = False
                 
                 elif "notify" in data:
                     # Heartbeat or other notifications
@@ -170,6 +177,11 @@ class SchwabStreamerClient:
                     if notify_data.get("heartbeat"):
                         if self.debug:
                             print("💓 Heartbeat received")
+                    elif notify_data.get("service") == "ADMIN":
+                        content = notify_data.get("content", {})
+                        if content.get("code") == 30:  # Empty subscription
+                            print("⚠️ Empty subscription detected, resubscribing...")
+                            self.subscribe_chart_data(self.tracked_symbols)
                 
                 elif "data" in data:
                     # Market data
@@ -178,26 +190,31 @@ class SchwabStreamerClient:
                         content = data_item.get("content", [])
                         
                         if service == "CHART_EQUITY" and content:
-                            for candle in content:
-                                # Check if this is a completed candle (not the current forming candle)
-                                if candle.get("complete", False):
-                                    # Format the candle data for the asset manager
-                                    formatted_candle = {
-                                        'timestamp': candle.get('timestamp', 0),
-                                        'open': candle.get('open', 0),
-                                        'high': candle.get('high', 0),
-                                        'low': candle.get('low', 0),
-                                        'close': candle.get('close', 0),
-                                        'volume': candle.get('volume', 0)
-                                    }
-                                    
-                                    symbol = candle.get("key")
-                                    if symbol in self.tracked_symbols:
-                                        self.asset_manager.add_new_candle(symbol, formatted_candle)
-                                        if self.debug:
-                                            print(f"Added completed candle for {symbol}: {formatted_candle}")
-                                elif self.debug:
-                                    print(f"Skipping incomplete candle for {candle.get('key')}")
+                            for candle_data in content:
+                                # Parse the numeric key format
+                                # 1: chart time
+                                # 2: open price
+                                # 3: high price
+                                # 4: low price
+                                # 5: close price
+                                # 6: volume
+                                # 7: timestamp
+                                # 8: sequence number
+                                formatted_candle = {
+                                    'timestamp': int(candle_data.get('7', 0)),  # Chart Time (milliseconds since Epoch)
+                                    'open': float(candle_data.get('2', 0)),     # Open Price
+                                    'high': float(candle_data.get('3', 0)),     # High Price
+                                    'low': float(candle_data.get('4', 0)),      # Low Price
+                                    'close': float(candle_data.get('5', 0)),    # Close Price
+                                    'volume': float(candle_data.get('6', 0))    # Volume
+                                }
+                                
+                                symbol = candle_data.get('key')  # Symbol (ticker symbol in upper case)
+                                if symbol in self.tracked_symbols:
+                                    # Add the new candle to the asset manager
+                                    self.asset_manager.add_new_candle(symbol, formatted_candle)
+                                    if self.debug:
+                                        print(f"Added new candle for {symbol}: {formatted_candle}")
                         
                         elif service == "LEVELONE_OPTIONS" and content:
                             for content_item in content:
@@ -285,55 +302,41 @@ class SchwabStreamerClient:
                                         if symbol in self.tracked_symbols:
                                             self.asset_manager.add_new_candle(symbol, candle)
                         
-        except json.JSONDecodeError as e:
-            print(f"❌ JSON decode error: {e}")
-            print(f"   Raw message: {message}")
         except Exception as e:
-            print(f"❌ Message handling error: {e}")
+            print(f"❌ Message handling error: {str(e)}")
             print(f"   Raw message: {message}")
-            import traceback
-            traceback.print_exc()
+            raise
 
     def on_error(self, ws, error):
         """Handle WebSocket errors"""
-        print(f"❌ WebSocket error: {error}")
+        print(f"❌ WebSocket error: {str(error)}")
+        self.connected = False
 
     def on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket close"""
-        print(f"🔌 WebSocket closed: {close_status_code} - {close_msg}")
+        """Handle WebSocket connection close"""
+        print(f"WebSocket connection closed: {close_status_code} - {close_msg}")
         self.connected = False
 
     def on_open(self, ws):
-        """Handle WebSocket open"""
+        """Handle WebSocket connection open"""
         print("🔗 WebSocket connected, attempting login...")
-        self.login()
+        self.running = True
+        self.login()  # Send login request immediately after connection
 
     def login(self):
-        """Login to the streaming service"""
+        """Send login request to WebSocket"""
         try:
-            # Get user preferences which contain streaming info
-            user_prefs = self.get_user_preferences()
-            
-            if self.debug:
-                print(f"🔍 User preferences: {json.dumps(user_prefs, indent=2)}")
-            
-            # Get fresh access token for login
+            # Get fresh token
             access_token = self.auth.get_access_token()
             if not access_token:
-                raise Exception("Failed to get access token for login")
-            
-            # Extract streaming info from user preferences
-            stream_info = user_prefs.get("streamerInfo", [{}])
-            if not stream_info:
-                raise Exception("No streaming info found in user preferences")
-            
-            self.streamer_info = stream_info[0]  # Store for later use in subscriptions
-            
-            login_request = {
+                raise Exception("Failed to get valid access token")
+
+            # Prepare login request
+            request = {
                 "service": "ADMIN",
                 "command": "LOGIN",
                 "requestid": str(self.request_id),
-                "SchwabClientCustomerId": self.streamer_info.get("schwabClientCustomerId", ""),
+                "SchwabClientCustomerId": self.schwab_client_customer_id,
                 "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
                 "parameters": {
                     "Authorization": access_token,
@@ -341,103 +344,109 @@ class SchwabStreamerClient:
                     "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId", "")
                 }
             }
-            
+
             if self.debug:
-                # Hide the full token in debug logs
-                debug_request = json.loads(json.dumps(login_request))
-                if len(debug_request["parameters"]["Authorization"]) > 20:
-                    debug_request["parameters"]["Authorization"] = debug_request["parameters"]["Authorization"][:20] + "..."
-                print(f"📤 Sending login: {json.dumps(debug_request, indent=2)}")
-            
-            self.ws.send(json.dumps(login_request))
+                print(f"📤 Sending login: {json.dumps(request, indent=2)}")
+
+            # Send login request
+            self.ws.send(json.dumps(request))
             self.request_id += 1
-            
+
         except Exception as e:
-            print(f"❌ Login failed: {e}")
+            print(f"❌ Login error: {str(e)}")
+            raise
 
     def connect(self):
-        """Connect to Schwab WebSocket API"""
-        if not self.auth.is_authenticated():
-            print("❌ Authentication failed. Cannot connect to WebSocket.")
-            return False
-        
+        """Connect to WebSocket and start streaming"""
         try:
-            # Get user preferences first to get the correct WebSocket URL
-            user_prefs = self.get_user_preferences()
-            stream_info = user_prefs.get("streamerInfo", [{}])
-            if not stream_info:
-                raise Exception("No streaming info found in user preferences")
-            
-            streamer_info = stream_info[0]
-            websocket_url = streamer_info.get("streamerSocketUrl", "wss://streamer-api.schwab.com/ws")
-            
-            if self.debug:
-                print(f"🔗 Connecting to: {websocket_url}")
-            
-            websocket.enableTrace(self.debug)
+            # Get streamer info from user preferences
+            if not self.streamer_info:
+                raise Exception("No streamer info available")
+
+            # Get WebSocket URL
+            ws_url = self.streamer_info.get('streamerSocketUrl')
+            if not ws_url:
+                raise Exception("No WebSocket URL in streamer info")
+
+            # Create WebSocket connection
             self.ws = websocket.WebSocketApp(
-                websocket_url,
+                ws_url,
                 on_message=self.on_message,
                 on_error=self.on_error,
                 on_close=self.on_close,
                 on_open=self.on_open
             )
-            
-            # Start WebSocket in separate thread
+
+            # Start WebSocket connection in a separate thread
             def run_ws():
                 self.ws.run_forever()
-            
-            self.ws_thread = threading.Thread(target=run_ws, daemon=True)
-            self.ws_thread.start()
-            self.running = True
-            
-            # Wait a moment for connection
-            time.sleep(2)
-            return self.connected
-            
+
+            # Start the WebSocket thread
+            ws_thread = threading.Thread(target=run_ws)
+            ws_thread.daemon = True
+            ws_thread.start()
+
+            # Wait for connection and login
+            timeout = 30  # Increased timeout to 30 seconds
+            start_time = time.time()
+            while not self.connected and time.time() - start_time < timeout:
+                time.sleep(0.1)
+
+            if not self.connected:
+                raise Exception("Failed to connect and login to WebSocket within timeout")
+
+            print("✅ Successfully connected and logged in to WebSocket")
+
+            # Keep the main thread alive and handle reconnection
+            while self.running:
+                if not self.connected:
+                    print("❌ Connection lost, attempting to reconnect...")
+                    self.ws.close()
+                    time.sleep(5)  # Wait before reconnecting
+                    self.connect()
+                time.sleep(1)
+
         except Exception as e:
-            print(f"❌ Connection failed: {e}")
-            return False
+            print(f"❌ WebSocket error: {str(e)}")
+            if self.ws:
+                self.ws.close()
+            raise
 
     def subscribe_chart_data(self, symbols: List[str]):
-        """Subscribe to CHART_EQUITY data (1-minute OHLCV candles)"""
+        """Subscribe to CHART_EQUITY data for the given symbols"""
         if not self.connected:
             print("❌ Not connected to WebSocket")
-            return False
-        
-        if not self.streamer_info:
-            print("❌ No streamer info available")
-            return False
-        
+            return
+
         try:
-            keys = ",".join(symbols)
-            fields = "0,1,2,3,4,5,6,7,8"
-            
+            # Prepare the subscription request
             request = {
                 "service": "CHART_EQUITY",
                 "command": "SUBS",
-                "requestid": str(self.request_id),
-                "SchwabClientCustomerId": self.streamer_info.get("schwabClientCustomerId", ""),
-                "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
+                "requestid": self.request_id,
+                "SchwabClientCustomerId": self.schwab_client_customer_id,
+                "SchwabClientCorrelId": f"chart_{int(time.time() * 1000)}",
                 "parameters": {
-                    "keys": keys,
-                    "fields": fields
+                    "keys": ",".join(symbols),
+                    "fields": "0,1,2,3,4,5,6,7,8"  # All fields: key,sequence,open,high,low,close,volume,time,chart_day
                 }
             }
-            
+
             if self.debug:
-                print(f"📤 Chart subscription: {json.dumps(request, indent=2)}")
-            
+                print(f"📤 Sending CHART_EQUITY subscription request: {json.dumps(request, indent=2)}")
+
+            # Send the subscription request
             self.ws.send(json.dumps(request))
-            self.subscriptions["CHART_EQUITY"] = symbols
             self.request_id += 1
-            
-            print(f"✅ Subscribed to CHART_EQUITY for: {symbols}")
-            return True
-            
+
+            # Store the subscription
+            self.subscriptions["CHART_EQUITY"] = symbols
+
+            print(f"✅ Subscribed to CHART_EQUITY data for: {', '.join(symbols)}")
+
         except Exception as e:
-            print(f"❌ Chart subscription failed: {e}")
-            return False
+            print(f"❌ Error subscribing to CHART_EQUITY data: {e}")
+            raise
 
     def subscribe_options_data(self, option_symbols: List[str]):
         """Subscribe to LEVELONE_OPTIONS data for real-time option prices"""
@@ -738,19 +747,6 @@ if __name__ == "__main__":
         # Connect to WebSocket
         print("🔄 Connecting to Schwab Streamer...")
         client.connect()
-        
-        # Get upcoming expirations for AAPL
-        symbol = "AAPL"
-        expirations = client.get_upcoming_expirations(symbol)
-        print(f"\n📅 Next 6 expiration dates for {symbol}:")
-        for i, exp in enumerate(expirations, 1):
-            # Convert YYMMDD to a more readable format
-            exp_date = datetime.strptime(exp, '%y%m%d')
-            print(f"   {i}. {exp_date.strftime('%Y-%m-%d')} (YYMMDD: {exp})")
-        
-        # Subscribe to option chain for next expiration
-        print(f"\n📊 Subscribing to option chain for {symbol}...")
-        client.subscribe_option_chain(symbol, expirations[0])
         
         # Keep the script running
         while True:
