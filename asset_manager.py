@@ -253,7 +253,7 @@ class AssetManager:
             # Only check for open trades in the same timeframe
             if self.trades[trade_key] is not None and self.trades[trade_key].get("status") == "open":
                 logger.error(f"Symbol {symbol} already has an open trade in timeframe {timeframe}")
-                return
+                return  
 
             self.trades[trade_key] = {
                 "entry_date": entry_date,
@@ -528,7 +528,7 @@ class AssetManager:
             
             # Add symbol column if it doesn't exist
             if 'symbol' not in df.columns:
-                df['symbol'] = symbol
+            df['symbol'] = symbol
             
             # Reorder columns
             columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
@@ -843,7 +843,7 @@ class AssetManager:
             if not os.path.exists(source_path):
                 logger.error(f"Error: Source file {source_path} does not exist")
                 return False
-                
+
             df = pd.read_csv(source_path)
             
             # Append new candle
@@ -866,7 +866,7 @@ class AssetManager:
             # Group by the new timeframe
             grouped = df.groupby(pd.Grouper(key='datetime', freq=rule))
             
-            # Aggregate the data
+            # Aggregate only the OHLCV data
             agg_df = grouped.agg({
                 'timestamp': 'first',    # Keep the first timestamp
                 'symbol': 'first',       # Keep the symbol
@@ -874,12 +874,7 @@ class AssetManager:
                 'high': 'max',           # Highest price in the period
                 'low': 'min',            # Lowest price in the period
                 'close': 'last',         # Last price in the period
-                'volume': 'sum',         # Sum of volume in the period
-                'ema7': 'last',          # Keep the last EMA7 value
-                'vwma17': 'last',        # Keep the last VWMA17 value
-                'roc8': 'last',          # Keep the last ROC8 value
-                'macd_line': 'last',     # Keep the last MACD line value
-                'macd_signal': 'last'    # Keep the last MACD signal value
+                'volume': 'sum'          # Sum of volume in the period
             }).reset_index()
             
             # Drop any rows with NaN values (incomplete periods)
@@ -889,8 +884,7 @@ class AssetManager:
             agg_df['datetime'] = agg_df['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
             
             # Reorder columns
-            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume',
-                      'ema7', 'vwma17', 'roc8', 'macd_line', 'macd_signal']
+            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
             agg_df = agg_df[columns]
             
             # Save regular aggregated data
@@ -907,8 +901,9 @@ class AssetManager:
             inverse_path = f"data/{target_timeframe}/{symbol}_inverse.csv"
             df_inverse.to_csv(inverse_path, index=False)
             
+            logger.info(f"Successfully aggregated new candle for {symbol} from {source_timeframe} to {target_timeframe}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error aggregating new candle for {symbol} from {source_timeframe} to {target_timeframe}: {str(e)}")
             return False
@@ -932,17 +927,21 @@ class AssetManager:
             if candle_time.floor('min') >= current_time.floor('min'):
                 logger.info(f"Skipping incomplete candle for {symbol} at {candle_time}")
                 return
-            
+
             # Add the new candle to the 1-minute data
             self.export_to_csv(pd.DataFrame([candle]), symbol, "1m")
             
             # Update all other timeframes
             for tf in self.timeframes:
-                self.aggregate_new_candle(symbol, candle, "1m", tf)
-                self.generate_inverse_ohlc(symbol, tf)
-                self.calculate_indicators(symbol, tf)
-                # During streaming, we want to send emails
-                self.process_signals(symbol, tf, send_email=True)
+                # First aggregate the new candle to the target timeframe
+                success = self.aggregate_new_candle(symbol, candle, "1m", tf)
+                if success:
+                    # Then calculate indicators for both regular and inverse data
+                    self.calculate_indicators(symbol, tf)
+                    # Finally process signals (with email notifications during streaming)
+                    self.process_signals(symbol, tf, send_email=True)
+                else:
+                    logger.error(f"Failed to aggregate new candle for {symbol} to {tf} timeframe")
 
         except Exception as e:
             logger.error(f"Error adding new candle for {symbol}: {str(e)}")
@@ -970,7 +969,7 @@ class AssetManager:
                 
             df = pd.read_csv(inverse_path)
             return df
-            
+
         except Exception as e:
             logger.error(f"Error reading inverse data for {symbol} {timeframe}: {str(e)}")
             return pd.DataFrame()

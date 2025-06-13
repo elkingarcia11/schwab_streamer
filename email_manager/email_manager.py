@@ -554,7 +554,7 @@ You currently have {len(open_positions)} active positions:
    Entry Price: ${entry_price:.2f}
    Current Price: ${current_price:.2f}
    Unrealized P&L: {pnl_text}
-   Entry Time: {entry_time}
+   Entry Time: {entry_time} 
 
 """
             
