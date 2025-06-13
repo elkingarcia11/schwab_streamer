@@ -75,10 +75,12 @@ class AssetManager:
             for timeframe in timeframes:
                 self.trades[symbol + "_" + timeframe] = None
                 self.trades[symbol + "_inverse_" + timeframe] = None
+                # First aggregate the timeframe
                 self.aggregate_timeframe(symbol, "1m", timeframe)
-                self.generate_inverse_ohlc(symbol, timeframe)
+                # Then calculate indicators for both regular and inverse data
                 self.calculate_indicators(symbol, timeframe)
-                self.process_signals(symbol, timeframe)
+                # Finally process signals (without sending emails during initialization)
+                self.process_signals(symbol, timeframe, send_email=False)
         
         # Send email with initial positions after processing all signals
         open_positions = []
@@ -107,12 +109,13 @@ class AssetManager:
         if open_positions:
             self.email_manager.send_open_positions_email(open_positions)
 
-    def process_signals(self, symbol: str, timeframe: str) -> None:
+    def process_signals(self, symbol: str, timeframe: str, send_email: bool = True) -> None:
         """
         Open csv, iterate through each row, check if buy or sell conditions are met, if so, record the action 
         Args:
             symbol (str): The symbol to open a trade for.
             timeframe (str): The timeframe to check indicators on.
+            send_email (bool): Whether to send email notifications (default: True)
         """
         try:
             # Read the latest data to check indicators
@@ -144,12 +147,10 @@ class AssetManager:
                     logger.debug(f"Skipping row {index} due to NaN values in indicators")
                     continue
 
-                # Check technical conditions
-                conditions_met = (
-                    row['roc8'] > 0 and
-                    row['ema7'] > row['vwma17'] and
-                    row['macd_line'] > row['macd_signal']
-                )
+                # Check individual conditions
+                roc_condition = row['roc8'] > 0
+                ema_condition = row['ema7'] > row['vwma17']
+                macd_condition = row['macd_line'] > row['macd_signal']
 
                 # Log the indicator values and conditions
                 logger.info(f"Row {index} indicators for {symbol}:")
@@ -158,16 +159,28 @@ class AssetManager:
                 logger.info(f"  VWMA17: {row['vwma17']:.4f}")
                 logger.info(f"  MACD Line: {row['macd_line']:.4f}")
                 logger.info(f"  MACD Signal: {row['macd_signal']:.4f}")
-                logger.info(f"  Conditions met: {conditions_met}")
+                logger.info(f"  ROC Condition: {roc_condition}")
+                logger.info(f"  EMA Condition: {ema_condition}")
+                logger.info(f"  MACD Condition: {macd_condition}")
 
-                if has_open_trade and not conditions_met:
-                    # Close Trade if conditions are no longer met
+                # Buy signal: All 3 conditions must be met
+                buy_signal = roc_condition and ema_condition and macd_condition
+
+                # Sell signal: At least 2 conditions must fail
+                conditions_failed = sum(1 for c in [roc_condition, ema_condition, macd_condition] if not c)
+                sell_signal = conditions_failed >= 2
+
+                logger.info(f"  Buy Signal: {buy_signal}")
+                logger.info(f"  Sell Signal: {sell_signal}")
+
+                if has_open_trade and sell_signal:
+                    # Close Trade if at least 2 conditions fail
                     logger.info(f"Closing trade for {symbol} at price {row['close']}")
-                    self.close_trade(symbol, timeframe, row['close'], row['timestamp'])
-                elif not has_open_trade and conditions_met:
-                    # Open Trade if conditions are met and no trade is open
+                    self.close_trade(symbol, timeframe, row['close'], row['timestamp'], send_email=send_email)
+                elif not has_open_trade and buy_signal:
+                    # Open Trade if all conditions are met and no trade is open
                     logger.info(f"Opening trade for {symbol} at price {row['close']}")
-                    self.open_trade(symbol, timeframe, row['close'], row['timestamp'])
+                    self.open_trade(symbol, timeframe, row['close'], row['timestamp'], send_email=send_email)
 
             # Process inverse trades
             for index, row in inverse_df.iterrows():
@@ -179,12 +192,10 @@ class AssetManager:
                     logger.debug(f"Skipping inverse row {index} due to NaN values in indicators")
                     continue
 
-                # Use the same technical conditions for inverse trades (not inverted)
-                conditions_met = (
-                    row['roc8'] > 0 and
-                    row['ema7'] > row['vwma17'] and
-                    row['macd_line'] > row['macd_signal']
-                )
+                # Check individual conditions
+                roc_condition = row['roc8'] > 0
+                ema_condition = row['ema7'] > row['vwma17']
+                macd_condition = row['macd_line'] > row['macd_signal']
 
                 # Log the indicator values and conditions for inverse
                 logger.info(f"Inverse row {index} indicators for {symbol}:")
@@ -193,30 +204,57 @@ class AssetManager:
                 logger.info(f"  VWMA17: {row['vwma17']:.4f}")
                 logger.info(f"  MACD Line: {row['macd_line']:.4f}")
                 logger.info(f"  MACD Signal: {row['macd_signal']:.4f}")
-                logger.info(f"  Conditions met: {conditions_met}")
+                logger.info(f"  ROC Condition: {roc_condition}")
+                logger.info(f"  EMA Condition: {ema_condition}")
+                logger.info(f"  MACD Condition: {macd_condition}")
 
-                if has_open_trade and not conditions_met:
+                # Buy signal: All 3 conditions must be met
+                buy_signal = roc_condition and ema_condition and macd_condition
+
+                # Sell signal: At least 2 conditions must fail
+                conditions_failed = sum(1 for c in [roc_condition, ema_condition, macd_condition] if not c)
+                sell_signal = conditions_failed >= 2
+
+                logger.info(f"  Buy Signal: {buy_signal}")
+                logger.info(f"  Sell Signal: {sell_signal}")
+
+                if has_open_trade and sell_signal:
                     logger.info(f"Closing inverse trade for {symbol} at price {row['close']}")
-                    self.close_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True)
-                elif not has_open_trade and conditions_met:
+                    self.close_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True, send_email=send_email)
+                elif not has_open_trade and buy_signal:
                     logger.info(f"Opening inverse trade for {symbol} at price {row['close']}")
-                    self.open_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True)
+                    self.open_trade(symbol, timeframe, row['close'], row['timestamp'], is_inverse=True, send_email=send_email)
         except Exception as e:
             logger.error(f"Error processing signals for {symbol} on {timeframe}: {str(e)}")
 
-    def open_trade(self, symbol: str, timeframe: str, entry_price: float, entry_date: int, is_inverse: bool = False) -> None:
+    def open_trade(self, symbol: str, timeframe: str, entry_price: float, entry_date: int, is_inverse: bool = False, send_email: bool = True) -> None:
         """
         Record open trade in trades dictionary and data/trades/open_trades.csv
+        Args:
+            symbol (str): The symbol to open a trade for
+            timeframe (str): The timeframe for the trade
+            entry_price (float): The entry price
+            entry_date (int): The entry timestamp in milliseconds
+            is_inverse (bool): Whether this is an inverse trade
+            send_email (bool): Whether to send email notification (default: True)
         """
         try:
+            # Validate entry_date is not in the future
+            current_time = int(time.time() * 1000)
+            if entry_date > current_time:
+                logger.error(f"Entry date {entry_date} is in the future")
+                return
+
             trade_key = f"{symbol}_{'inverse_' if is_inverse else ''}{timeframe}"
             if trade_key not in self.trades:
                 logger.error(f"Symbol {symbol} with timeframe {timeframe} is not being tracked")
                 return
 
-            if self.trades[trade_key] is not None:
-                logger.error(f"Symbol {symbol} already has an open trade")
-                return  
+            # Only check for open trades in the same timeframe
+            if self.trades[trade_key] is not None and self.trades[trade_key].get("status") == "open":
+                logger.error(f"Symbol {symbol} already has an open trade in timeframe {timeframe}")
+                return
+
             self.trades[trade_key] = {
                 "entry_date": entry_date,
                 "entry_price": entry_price,
@@ -236,12 +274,31 @@ class AssetManager:
                 entry_dt = pd.to_datetime(entry_date, unit='ms', utc=True).dt.tz_convert('US/Eastern').dt.strftime('%Y-%m-%d %H:%M:%S') if isinstance(entry_date, (int, float)) else entry_date
                 writer.writerow([symbol, timeframe, entry_dt, entry_price, "open"])
 
+            # Send email notification for trade opening only if requested
+            if send_email:
+                position_type = "SHORT" if is_inverse else "LONG"
+                self.email_manager.send_position_notification(
+                    symbol=symbol,
+                    period=timeframe,
+                    position_type=position_type,
+                    action="OPEN",
+                    price=entry_price,
+                    timestamp=entry_date
+                )
+
         except Exception as e:
             logger.error(f"Error opening trade for {symbol}: {str(e)}")
 
-    def close_trade(self, symbol: str, timeframe: str, exit_price: float, exit_date: int = None, is_inverse: bool = False) -> None:
+    def close_trade(self, symbol: str, timeframe: str, exit_price: float, exit_date: int = None, is_inverse: bool = False, send_email: bool = True) -> None:
         """
         Update trades dictionary and data/trades/open_trades.csv and record in data/trades/closed_trades.csv
+        Args:
+            symbol (str): The symbol to close a trade for
+            timeframe (str): The timeframe for the trade
+            exit_price (float): The exit price
+            exit_date (int): The exit timestamp in milliseconds
+            is_inverse (bool): Whether this is an inverse trade
+            send_email (bool): Whether to send email notification (default: True)
         """
         try:
             trade_key = f"{symbol}_{'inverse_' if is_inverse else ''}{timeframe}"
@@ -254,7 +311,21 @@ class AssetManager:
                 return
 
             trade = self.trades[trade_key]
-            exit_date_val = exit_date or int(time.time() * 1000)
+            if trade.get("status") == "closed":
+                logger.error(f"Trade for {symbol} on {timeframe} is already closed")
+                return
+
+            # Validate exit_date is not in the future and is after entry_date
+            current_time = int(time.time() * 1000)
+            exit_date_val = exit_date or current_time
+            if exit_date_val > current_time:
+                logger.error(f"Exit date {exit_date_val} is in the future")
+                return
+            if exit_date_val <= trade["entry_date"]:
+                logger.error(f"Exit date {exit_date_val} is before or equal to entry date {trade['entry_date']}")
+                return
+
+            # Update trade with exit information
             trade.update({
                 "exit_date": exit_date_val,
                 "exit_price": exit_price,
@@ -294,6 +365,20 @@ class AssetManager:
                 writer.writerow(["symbol", "timeframe", "entry_date", "entry_price", "status"])
                 for row in open_trades:
                     writer.writerow(row[:-1])  # Exclude raw timestamp
+
+            # Send email notification for trade closing only if requested
+            if send_email:
+                position_type = "SHORT" if is_inverse else "LONG"
+                self.email_manager.send_position_notification(
+                    symbol=symbol,
+                    period=timeframe,
+                    position_type=position_type,
+                    action="CLOSE",
+                    price=exit_price,
+                    timestamp=exit_date_val,
+                    pnl=trade["pnl"],
+                    pnl_pct=trade["pnl_pct"]
+                )
 
             # Clear the trade from trades dictionary
             self.trades[trade_key] = None
@@ -623,7 +708,7 @@ class AssetManager:
 
     def calculate_indicators(self, symbol: str, timeframe: str) -> None:
         """
-        Calculate technical indicators for both regular and inverse data.
+        Calculate technical indicators for both regular and inverse data using the entire dataset.
 
         Args:
             symbol (str): The equity symbol (e.g., 'AAPL').
@@ -638,19 +723,19 @@ class AssetManager:
         # Read regular data
         df_regular = pd.read_csv(regular_path)
         
-        # Calculate indicators for regular data
+        # Calculate indicators for regular data using entire dataset
         # EMA 7
-        df_regular['ema7'] = ta.ema(df_regular['close'], length=7)
+        df_regular['ema7'] = ta.ema(df_regular['close'], length=self.EMA_PERIOD)
         
         # EMAs for MACD
         df_regular['ema12'] = ta.ema(df_regular['close'], length=self.MACD_FAST)
         df_regular['ema26'] = ta.ema(df_regular['close'], length=self.MACD_SLOW)
         
         # VWMA 17
-        df_regular['vwma17'] = ta.vwma(df_regular['close'], df_regular['volume'], length=17)
+        df_regular['vwma17'] = ta.vwma(df_regular['close'], df_regular['volume'], length=self.VWMA_PERIOD)
         
         # ROC 8
-        df_regular['roc8'] = ta.roc(df_regular['close'], length=8)
+        df_regular['roc8'] = ta.roc(df_regular['close'], length=self.ROC_PERIOD)
         
         # MACD
         try:
@@ -662,6 +747,9 @@ class AssetManager:
             logger.error(f"MACD calculation failed for {symbol} {timeframe}: {e}")
             df_regular['macd_line'] = np.nan
             df_regular['macd_signal'] = np.nan
+        
+        # Drop intermediate columns used for calculations
+        df_regular = df_regular.drop(['ema12', 'ema26'], axis=1)
         
         # Save regular data with indicators
         df_regular.to_csv(regular_path, index=False)
@@ -676,19 +764,19 @@ class AssetManager:
         # Read inverse data
         df_inverse = pd.read_csv(inverse_path)
         
-        # Calculate indicators for inverse data
+        # Calculate indicators for inverse data using entire dataset
         # EMA 7
-        df_inverse['ema7'] = ta.ema(df_inverse['close'], length=7)
+        df_inverse['ema7'] = ta.ema(df_inverse['close'], length=self.EMA_PERIOD)
         
         # EMAs for MACD
         df_inverse['ema12'] = ta.ema(df_inverse['close'], length=self.MACD_FAST)
         df_inverse['ema26'] = ta.ema(df_inverse['close'], length=self.MACD_SLOW)
         
         # VWMA 17
-        df_inverse['vwma17'] = ta.vwma(df_inverse['close'], df_inverse['volume'], length=17)
+        df_inverse['vwma17'] = ta.vwma(df_inverse['close'], df_inverse['volume'], length=self.VWMA_PERIOD)
         
         # ROC 8
-        df_inverse['roc8'] = ta.roc(df_inverse['close'], length=8)
+        df_inverse['roc8'] = ta.roc(df_inverse['close'], length=self.ROC_PERIOD)
         
         # MACD
         try:
@@ -700,6 +788,9 @@ class AssetManager:
             logger.error(f"MACD calculation failed for {symbol} {timeframe} (inverse): {e}")
             df_inverse['macd_line'] = np.nan
             df_inverse['macd_signal'] = np.nan
+        
+        # Drop intermediate columns used for calculations
+        df_inverse = df_inverse.drop(['ema12', 'ema26'], axis=1)
         
         # Save inverse data with indicators
         df_inverse.to_csv(inverse_path, index=False)
@@ -783,7 +874,12 @@ class AssetManager:
                 'high': 'max',           # Highest price in the period
                 'low': 'min',            # Lowest price in the period
                 'close': 'last',         # Last price in the period
-                'volume': 'sum'          # Sum of volume in the period
+                'volume': 'sum',         # Sum of volume in the period
+                'ema7': 'last',          # Keep the last EMA7 value
+                'vwma17': 'last',        # Keep the last VWMA17 value
+                'roc8': 'last',          # Keep the last ROC8 value
+                'macd_line': 'last',     # Keep the last MACD line value
+                'macd_signal': 'last'    # Keep the last MACD signal value
             }).reset_index()
             
             # Drop any rows with NaN values (incomplete periods)
@@ -793,7 +889,8 @@ class AssetManager:
             agg_df['datetime'] = agg_df['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
             
             # Reorder columns
-            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
+            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume',
+                      'ema7', 'vwma17', 'roc8', 'macd_line', 'macd_signal']
             agg_df = agg_df[columns]
             
             # Save regular aggregated data
@@ -815,226 +912,6 @@ class AssetManager:
         except Exception as e:
             logger.error(f"Error aggregating new candle for {symbol} from {source_timeframe} to {target_timeframe}: {str(e)}")
             return False
-
-    def calculate_latest_indicators(self, symbol: str, timeframe: str, new_candle: Dict[str, Any]) -> None:
-        """
-        Efficiently calculates indicators for the latest candle only, using necessary historical data.
-        """
-        try:
-            data_path = f"data/{timeframe}/{symbol}.csv"
-            if not os.path.exists(data_path):
-                logger.error(f"Data file {data_path} does not exist")
-                return
-
-            # Read the data
-            df = pd.read_csv(data_path)
-            
-            # Calculate indicators for the latest candle
-            latest_idx = len(df) - 1
-            
-            # ROC (Rate of Change)
-            if latest_idx >= self.ROC_PERIOD:
-                df.loc[latest_idx, 'roc8'] = ((df.loc[latest_idx, 'close'] - df.loc[latest_idx - self.ROC_PERIOD, 'close']) 
-                                             / df.loc[latest_idx - self.ROC_PERIOD, 'close'] * 100)
-            
-            # EMA (Exponential Moving Average)
-            if latest_idx >= self.EMA_PERIOD:
-                df.loc[latest_idx, 'ema7'] = ta.ema(df['close'], length=self.EMA_PERIOD).iloc[-1]
-            
-            # VWMA (Volume Weighted Moving Average)
-            if latest_idx >= self.VWMA_PERIOD:
-                df.loc[latest_idx, 'vwma17'] = ta.vwma(df['close'], df['volume'], length=self.VWMA_PERIOD).iloc[-1]
-            
-            # MACD
-            if latest_idx >= self.MACD_SLOW:
-                macd = ta.macd(df['close'], 
-                             fast=self.MACD_FAST, 
-                             slow=self.MACD_SLOW, 
-                             signal=self.MACD_SIGNAL)
-                df.loc[latest_idx, 'macd_line'] = macd['MACD_12_26_9'].iloc[-1]
-                df.loc[latest_idx, 'macd_signal'] = macd['MACDs_12_26_9'].iloc[-1]
-            
-            # Save the updated data
-            df.to_csv(data_path, index=False)
-            logger.info(f"Successfully calculated latest indicators for {symbol} on {timeframe}")
-
-        except Exception as e:
-            logger.error(f"Error calculating latest indicators for {symbol} on {timeframe}: {str(e)}")
-
-    def process_latest_signals(self, symbol: str, timeframe: str) -> None:
-        """
-        Process the latest signals for a symbol and timeframe.
-
-        Args:
-            symbol (str): The equity symbol (e.g., 'AAPL').
-            timeframe (str): The timeframe (e.g., '1m', '5m').
-        """
-        try:
-            # Read the latest data
-            data_path = f"data/{timeframe}/{symbol}.csv"
-            if not os.path.exists(data_path):
-                logger.error(f"Data file {data_path} does not exist")
-                return
-                
-            df = pd.read_csv(data_path)
-            if df.empty:
-                logger.warning(f"No data available for {symbol} {timeframe}")
-                return
-                
-            # Get the latest row
-            latest_row = df.iloc[-1]
-            
-            # Check if we have all required indicators
-            if not any(pd.isna(latest_row[col]) for col in ['roc8', 'ema7', 'vwma17', 'macd_line', 'macd_signal']):
-                # Check for long entry conditions
-                conditions_met = (
-                    latest_row['roc8'] > 0 and
-                    latest_row['ema7'] > latest_row['vwma17'] and
-                    latest_row['macd_line'] > latest_row['macd_signal']
-                )
-                
-                # Get current trade status
-                trade_key = f"{symbol}_{timeframe}"
-                has_open_trade = self.trades[trade_key] is not None
-                
-                # Process long signals
-                if has_open_trade and not conditions_met:
-                    close_price = latest_row['close']
-                    self.close_trade(symbol, timeframe, close_price, latest_row['timestamp'])
-                    logger.info(f"Closed long trade for {symbol} at {close_price}")
-                    
-                    # Update positions for email
-                    positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
-                    
-                    # Send email notification
-                    self.email_manager.send_position_notification(
-                        symbol=symbol,
-                        period=timeframe,
-                        position_type="LONG",
-                        action="CLOSE",
-                        signal_details={
-                            'price': close_price,
-                            'conditions_met': 0,
-                            'condition_summary': 'Exit conditions met',
-                            'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                        },
-                        pnl_info={
-                            'opening_price': self.trades[trade_key]['entry_price'],
-                            'closing_price': close_price,
-                            'pnl_dollar': close_price - self.trades[trade_key]['entry_price'],
-                            'pnl_percent': ((close_price - self.trades[trade_key]['entry_price']) / self.trades[trade_key]['entry_price']) * 100,
-                            'total_pnl': close_price - self.trades[trade_key]['entry_price']
-                        },
-                        positions=positions
-                    )
-                elif not has_open_trade and conditions_met:
-                    entry_price = latest_row['close']
-                    self.open_trade(symbol, timeframe, entry_price, latest_row['timestamp'])
-                    logger.info(f"Opened long trade for {symbol} at {entry_price}")
-                    
-                    # Update positions for email
-                    positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
-                    
-                    # Send email notification
-                    self.email_manager.send_position_notification(
-                        symbol=symbol,
-                        period=timeframe,
-                        position_type="LONG",
-                        action="OPEN",
-                        signal_details={
-                            'price': entry_price,
-                            'conditions_met': 3,
-                            'condition_summary': 'All conditions met',
-                            'timestamp': pd.to_datetime(latest_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                        },
-                        pnl_info=None,
-                        positions=positions
-                    )
-            
-            # Process inverse signals
-            inverse_data_path = f"data/{timeframe}/{symbol}_inverse.csv"
-            if not os.path.exists(inverse_data_path):
-                logger.error(f"Inverse data file {inverse_data_path} does not exist")
-                return
-                
-            inverse_df = pd.read_csv(inverse_data_path)
-            if inverse_df.empty:
-                logger.warning(f"No inverse data available for {symbol} {timeframe}")
-                return
-                
-            latest_inverse_row = inverse_df.iloc[-1]
-            
-            # Check if we have all required indicators for inverse
-            if not any(pd.isna(latest_inverse_row[col]) for col in ['roc8', 'ema7', 'vwma17', 'macd_line', 'macd_signal']):
-                # Check for inverse entry conditions
-                conditions_met = (
-                    latest_inverse_row['roc8'] > 0 and
-                    latest_inverse_row['ema7'] > latest_inverse_row['vwma17'] and
-                    latest_inverse_row['macd_line'] > latest_inverse_row['macd_signal']
-                )
-                
-                # Get current inverse trade status
-                inverse_trade_key = f"{symbol}_inverse_{timeframe}"
-                has_open_inverse_trade = self.trades[inverse_trade_key] is not None
-                
-                # Process inverse signals
-                if has_open_inverse_trade and not conditions_met:
-                    close_price = latest_inverse_row['close']
-                    self.close_trade(symbol, timeframe, close_price, latest_inverse_row['timestamp'], is_inverse=True)
-                    logger.info(f"Closed inverse trade for {symbol} at {close_price}")
-                    
-                    # Update positions for email
-                    positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
-                    
-                    # Send email notification
-                    self.email_manager.send_position_notification(
-                        symbol=symbol,
-                        period=timeframe,
-                        position_type="SHORT",
-                        action="CLOSE",
-                        signal_details={
-                            'price': close_price,
-                            'conditions_met': 0,
-                            'condition_summary': 'Exit conditions met',
-                            'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                        },
-                        pnl_info={
-                            'opening_price': self.trades[inverse_trade_key]['entry_price'],
-                            'closing_price': close_price,
-                            'pnl_dollar': close_price - self.trades[inverse_trade_key]['entry_price'],
-                            'pnl_percent': ((close_price - self.trades[inverse_trade_key]['entry_price']) / self.trades[inverse_trade_key]['entry_price']) * 100,
-                            'total_pnl': close_price - self.trades[inverse_trade_key]['entry_price']
-                        },
-                        positions=positions,
-                        is_inverse=True
-                    )
-                elif not has_open_inverse_trade and conditions_met:
-                    entry_price = latest_inverse_row['close']
-                    self.open_trade(symbol, timeframe, entry_price, latest_inverse_row['timestamp'], is_inverse=True)
-                    logger.info(f"Opened inverse trade for {symbol} at {entry_price}")
-                    
-                    # Update positions for email
-                    positions = {tf: 'L' if not self.trades.get(f"{symbol}_{tf}") else 'S' if not self.trades.get(f"{symbol}_inverse_{tf}") else 'N' for tf in self.timeframes}
-                    
-                    # Send email notification
-                    self.email_manager.send_position_notification(
-                        symbol=symbol,
-                        period=timeframe,
-                        position_type="SHORT",
-                        action="OPEN",
-                        signal_details={
-                            'price': entry_price,
-                            'conditions_met': 3,
-                            'condition_summary': 'All conditions met',
-                            'timestamp': pd.to_datetime(latest_inverse_row['timestamp'], unit='ms', utc=True).tz_convert('US/Eastern').strftime('%Y-%m-%d %H:%M:%S')
-                        },
-                        pnl_info=None,
-                        positions=positions,
-                        is_inverse=True
-                    )
-                    
-        except Exception as e:
-            logger.error(f"Error processing latest signals for {symbol} {timeframe}: {str(e)}")
 
     def add_new_candle(self, symbol: str, candle: dict) -> None:
         """
@@ -1063,9 +940,10 @@ class AssetManager:
             for tf in self.timeframes:
                 self.aggregate_new_candle(symbol, candle, "1m", tf)
                 self.generate_inverse_ohlc(symbol, tf)
-                self.calculate_latest_indicators(symbol, tf, candle)
-                self.process_latest_signals(symbol, tf)
-                
+                self.calculate_indicators(symbol, tf)
+                # During streaming, we want to send emails
+                self.process_signals(symbol, tf, send_email=True)
+
         except Exception as e:
             logger.error(f"Error adding new candle for {symbol}: {str(e)}")
 
