@@ -197,7 +197,7 @@ class AssetManager:
                 # Check individual conditions
                 roc_condition = row['roc8'] > 0
                 ema_condition = row['ema7'] > row['vwma17']
-                macd_condition = row['macd_line'] > row['macd_signal']
+                macd_condition = row['macd_signal'] > row['macd_line']
 
                 # Log the indicator values and conditions
                 logger.info(f"Row {index} indicators for {symbol}:")
@@ -244,7 +244,7 @@ class AssetManager:
                 # Check individual conditions
                 roc_condition = row['roc8'] > 0
                 ema_condition = row['ema7'] > row['vwma17']
-                macd_condition = row['macd_line'] > row['macd_signal']
+                macd_condition = row['macd_signal'] > row['macd_line']
 
                 # Log the indicator values and conditions for inverse
                 logger.info(f"Inverse row {index} indicators for {symbol}:")

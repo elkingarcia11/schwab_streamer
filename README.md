@@ -106,10 +106,12 @@ python3 schwab_streamer_client.py
 ## Main Components
 
 ### `schwab_streamer_client.py`
+
 - Entry point for the system.
 - Handles authentication, loads symbols, initializes the `AssetManager`, and manages the streaming connection.
 
 ### `asset_manager.py`
+
 - Fetches and stores historical data.
 - Aggregates data into higher timeframes.
 - Calculates technical indicators.
@@ -117,11 +119,13 @@ python3 schwab_streamer_client.py
 - Handles data export and ensures only completed candles are saved.
 
 ### `email_manager/email_manager.py`
+
 - Loads email configuration.
 - Sends notifications for position changes, open trades, and system status.
 - Supports test emails and summary emails.
 
 ### `schwab_auth.py`
+
 - Manages Schwab API authentication.
 - Handles token refresh and credential loading.
 
@@ -157,4 +161,36 @@ MIT License
 
 ## Disclaimer
 
-This project is for educational and research purposes only. Use at your own risk. Not intended for live trading without further review and compliance with Schwab's API terms and financial regulations. 
+This project is for educational and research purposes only. Use at your own risk. Not intended for live trading without further review and compliance with Schwab's API terms and financial regulations.
+
+## Buy Conditions
+
+### Regular Trades (LONG)
+
+A regular trade is opened when ALL of the following conditions are met:
+
+1. ROC8 > 0.05 (Rate of Change is positive and significant)
+2. EMA7 > VWMA17 (Short-term trend is above long-term trend)
+3. MACD Line > MACD Signal (Momentum is increasing)
+
+### Inverse Trades (SHORT)
+
+An inverse trade is opened when ALL of the following conditions are met:
+
+1. ROC8 < -0.05 (Rate of Change is negative and significant)
+2. EMA7 < VWMA17 (Short-term trend is below long-term trend)
+3. MACD Line < MACD Signal (Momentum is decreasing)
+
+### Position Management
+
+- Each position is managed independently
+- Positions are closed when the opposite conditions are met
+- Maximum of one position per symbol at a time
+- Trades are executed at the close price of the candle that triggers the signal
+
+### Technical Indicators
+
+- ROC8: 8-period Rate of Change
+- EMA7: 7-period Exponential Moving Average
+- VWMA17: 17-period Volume Weighted Moving Average
+- MACD: 12,26,9 Moving Average Convergence Divergence
