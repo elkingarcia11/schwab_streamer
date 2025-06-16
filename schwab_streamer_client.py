@@ -12,7 +12,6 @@ from typing import List
 import json
 import time
 import threading
-from datetime import datetime
 import httpx
 import websocket
 import requests
@@ -33,7 +32,7 @@ class SchwabStreamerClient:
         self.message_handlers = {}
         self.streamer_info = None  # Store streamer info for subscription requests
         self.tracked_symbols = self.load_symbols_from_file()
-        self.timeframes = ["3m", "5m","10m", "15m", "30m"]
+        self.timeframes = ["5m","10m", "15m", "30m"]
         # Get start time for 9:30am ET in current timezone
         start_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=9, minute=30, second=0, microsecond=0)
         print(start_time)
@@ -44,7 +43,7 @@ class SchwabStreamerClient:
         self.start_date = int(start_time.timestamp() * 1000)
         # Get 4:00pm ET in epoch milliseconds
         self.end_date = int(end_time.timestamp() * 1000)
-        self.asset_manager = AssetManager(self.auth, self.tracked_symbols, self.timeframes, self.start_date, self.end_date)
+        self.asset_manager = AssetManager(self.auth, self.timeframes, self.start_date, self.end_date)
         
         # Get user preferences and store SchwabClientCustomerId
         self.user_preferences = self.get_user_preferences()
@@ -398,13 +397,21 @@ class SchwabStreamerClient:
             print("✅ Successfully connected and logged in to WebSocket")
 
             # Keep the main thread alive and handle reconnection
+            last_bootstrap_time = 0
             while self.running:
                 if not self.connected:
-                    print("❌ Connection lost, attempting to reconnect...")
-                    self.ws.close()
-                    time.sleep(5)  # Wait before reconnecting
-                    self.connect()
-                time.sleep(1)
+                    current_time = time.time()
+                    # Run bootstrap every 60 seconds while disconnected
+                    if current_time - last_bootstrap_time >= 60:
+                        print("❌ Connection lost, attempting to reconnect...")
+                        self.ws.close()
+                        print("📊 Bootstrapping historical data after disconnection...")
+                        self.asset_manager.bootstrap_for_streaming()
+                        last_bootstrap_time = current_time
+                        self.connect()
+                    time.sleep(1)
+                else:
+                    time.sleep(1)
 
         except Exception as e:
             print(f"❌ WebSocket error: {str(e)}")

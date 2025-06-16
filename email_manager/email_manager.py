@@ -22,6 +22,46 @@ class EmailManager:
         
         self._load_credentials()
     
+    def send_trade_log_email(self, trade_log_csv_path, subject="Trade Log Summary", body=None):
+        if not self.enabled:
+            print("EmailManager is disabled.")
+            return False
+
+        if not self.recipients:
+            print("No email recipients configured.")
+            return False
+
+        if body is None:
+            body = f"Attached is the trade log summary. Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}."
+
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.sender
+            msg['To'] = ", ".join(self.recipients)
+            msg['Subject'] = subject
+            msg.set_content(body)
+
+            # Attach the CSV file
+            with open(trade_log_csv_path, 'rb') as f:
+                file_data = f.read()
+                file_name = trade_log_csv_path.split('/')[-1]
+
+            msg.add_attachment(file_data, maintype='text', subtype='csv', filename=file_name)
+
+            # Connect and send email
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as smtp:
+                smtp.starttls()
+                smtp.login(self.sender, self.password)
+                smtp.send_message(msg)
+
+            self.last_open_positions_email = time.time()
+            print(f"Trade log email sent to {self.recipients}")
+            return True
+
+        except Exception as e:
+            print(f"Failed to send trade log email: {e}")
+            return False
+        
     def _load_credentials(self):
         """Load email credentials from environment file"""
         try:

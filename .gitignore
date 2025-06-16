@@ -13,3 +13,4 @@ schwab_access_token.txt
 *.log
 data/
 OPTION_CHAIN_RESPONSE.json
+data_copy/

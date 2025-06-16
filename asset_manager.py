@@ -46,7 +46,6 @@ class AssetManager:
     def __init__(
         self,
         auth: SchwabAuth,
-        symbols: List[str],
         timeframes: List[str],
         start_date: int,
         end_date: int
@@ -56,28 +55,33 @@ class AssetManager:
 
         Args:
             auth (SchwabAuth): Authenticated Schwab API client.
-            symbols (List[str]): List of symbols to track.
             timeframes (List[str]): List of timeframes to track.
             start_date (int): Start date in milliseconds.
             end_date (int): End date in milliseconds.
         """
         self.auth = auth
-        self.symbols = symbols
+        self.symbols = self.load_symbols_from_file()
         self.timeframes = timeframes
         self.start_date = start_date
         self.end_date = end_date
         self.trades = {}
         self.email_manager = EmailManager()
         
+        # Create all required data directories
+        for tf in timeframes:
+            os.makedirs(f"data/{tf}", exist_ok=True)
+
+    def bootstrap_for_streaming(self, source_timeframe: str = "1m"):
         # Initialize trade tracking and fetch data for each symbol
-        for symbol in symbols:
-            self.fetch(symbol)
-            for timeframe in timeframes:
+        for symbol in self.symbols:
+            self.fetch(symbol, source_timeframe)
+            self.generate_inverse_ohlc(symbol, source_timeframe)
+            for timeframe in self.timeframes:
                 self.trades[symbol + "_" + timeframe] = None
                 self.trades[symbol + "_inverse_" + timeframe] = None
-                # First aggregate the timeframe
-                self.aggregate_timeframe(symbol, "1m", timeframe)
-                # Then calculate indicators for both regular and inverse data
+                # Aggregate to other timeframes
+                self.aggregate_timeframe(symbol, source_timeframe, timeframe)
+                # Calculate indicators for both regular and inverse data
                 self.calculate_indicators(symbol, timeframe)
                 # Finally process signals (without sending emails during initialization)
                 self.process_signals(symbol, timeframe, send_email=False)
@@ -87,8 +91,8 @@ class AssetManager:
         total_transactions = 0
         
         # Count open positions and total transactions from CSV files
-        for symbol in symbols:
-            for timeframe in timeframes:
+        for symbol in self.symbols:
+            for timeframe in self.timeframes:
                 trade_key = f"{symbol}_{timeframe}"
                 inverse_trade_key = f"{symbol}_inverse_{timeframe}"
                 
@@ -127,12 +131,12 @@ class AssetManager:
                     logger.warning(f"Could not count transactions for {symbol}_{timeframe}: {e}")
         
         # Calculate total processed combinations
-        total_processed = len(symbols) * len(timeframes) * 2  # Regular + Inverse
+        total_processed = len(self.symbols) * len(self.timeframes) * 2  # Regular + Inverse
         
         # Send bootstrap summary email with all the information
-        logger.info(f"📧 Sending bootstrap summary email - {len(symbols)} symbols, {total_processed} combinations, {len(open_positions)} open positions, {total_transactions} transactions")
+        logger.info(f"📧 Sending bootstrap summary email - {len(self.symbols)} symbols, {total_processed} combinations, {len(open_positions)} open positions, {total_transactions} transactions")
         self.email_manager.send_bootstrap_summary_email(
-            symbols=symbols,
+            symbols=self.symbols,
             total_processed=total_processed,
             open_positions_count=len(open_positions),
             transaction_count=total_transactions
@@ -495,7 +499,7 @@ class AssetManager:
         except Exception as e:
             logger.error(f"Error closing trade for {symbol}: {str(e)}")
 
-    def fetch(self, symbol: str) -> Optional[pd.DataFrame]:
+    def fetch(self, symbol: str, timeframe: str = "1m", period: int = 1, frequencyType: str = "minute") -> Optional[pd.DataFrame]:
         """
         Fetch historical price data for a symbol.
 
@@ -515,24 +519,15 @@ class AssetManager:
                 "accept": "application/json",
                 "Authorization": f"Bearer {access_token}"
             }
-            
-            # Calculate the last complete minute (current minute - 1)
-            current_time = pd.Timestamp.now(tz=self.TIMEZONE)
-            last_complete_minute = current_time.floor('min') - pd.Timedelta(minutes=1)
-            last_complete_timestamp = int(last_complete_minute.timestamp() * 1000)
-            
-            logger.info(f"Current time: {current_time}")
-            logger.info(f"Last complete minute: {last_complete_minute}")
-            logger.info(f"Last complete timestamp: {last_complete_timestamp}")
-            
+
             params = {
                 "symbol": symbol,
                 "periodType": "day",
-                "period": 1,
-                "frequencyType": "minute",
-                "frequency": 1,
+                "period": period,
+                "frequencyType": frequencyType,
+                "frequency": int(timeframe.replace('m', '')),
                 "startDate": self.start_date,
-                "endDate": last_complete_timestamp,  # Use last complete minute as end date
+                "endDate": self.end_date,  # Use last complete minute as end date
             }
 
             # Print params and headers for debugging
@@ -580,6 +575,17 @@ class AssetManager:
             # Drop the temporary time column
             df = df.drop('time', axis=1)
             
+                        
+            # Calculate the last complete minute (current minute - 1)
+            current_time = pd.Timestamp.now(tz=self.TIMEZONE)
+            last_complete_minute = current_time.floor('min') - pd.Timedelta(minutes=1)
+            last_complete_timestamp = int(last_complete_minute.timestamp() * 1000)
+            
+            logger.info(f"Current time: {current_time}")
+            logger.info(f"Last complete minute: {last_complete_minute}")
+            logger.info(f"Last complete timestamp: {last_complete_timestamp}")
+            
+
             # Filter out the current minute's data
             df = df[df['datetime'].dt.floor('min') < current_time.floor('min')]
             
@@ -594,21 +600,8 @@ class AssetManager:
             df['datetime'] = df['datetime'].dt.tz_convert('UTC').astype('int64') // 10**6
             df = df.rename(columns={'datetime': 'timestamp'})  # Rename datetime to timestamp
 
-            # Create all required data directories
-            timeframes = ['1m', '3m', '5m', '10m', '15m', '30m']
-            for tf in timeframes:
-                os.makedirs(f"data/{tf}", exist_ok=True)
-
             # Export to CSV
-            self.export_to_csv(df, symbol, "1m")
-            
-            # Generate inverse data
-            self.generate_inverse_ohlc(symbol, "1m")
-            
-            # Aggregate to other timeframes
-            for tf in self.timeframes:
-                self.aggregate_timeframe(symbol, "1m", tf)
-                self.generate_inverse_ohlc(symbol, tf)
+            self.export_to_csv(df, symbol, timeframe)
             
             return df
 
@@ -637,7 +630,7 @@ class AssetManager:
             
             # Add symbol column if it doesn't exist
             if 'symbol' not in df.columns:
-            df['symbol'] = symbol
+                df['symbol'] = symbol
             
             # Reorder columns
             columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
@@ -732,7 +725,8 @@ class AssetManager:
 
     def aggregate_timeframe(self, symbol: str, source_timeframe: str, target_timeframe: str) -> None:
         """
-        Aggregate data from one timeframe to another and generate both regular and inverse files.
+        Aggregate data from a source timeframe to a target timeframe.
+        Only aggregates if target timeframe is a multiple of source timeframe.
 
         Args:
             symbol (str): The equity symbol (e.g., 'AAPL').
@@ -740,10 +734,14 @@ class AssetManager:
             target_timeframe (str): The target timeframe (e.g., '5m', '15m').
         """
         try:
-            # Create all required data directories
-            timeframes = ['1m', '3m', '5m', '10m', '15m', '30m']
-            for tf in timeframes:
-                os.makedirs(f"data/{tf}", exist_ok=True)
+            # Convert timeframes to minutes
+            source_minutes = int(source_timeframe.replace('m', ''))
+            target_minutes = int(target_timeframe.replace('m', ''))
+            
+            # Only aggregate if target is a multiple of source
+            if target_minutes <= source_minutes or target_minutes % source_minutes != 0:
+                logger.info(f"Skipping aggregation from {source_timeframe} to {target_timeframe} - not a valid multiple")
+                return
                 
             # Read the source CSV file
             source_path = f"data/{source_timeframe}/{symbol}.csv"
@@ -753,67 +751,40 @@ class AssetManager:
 
             # Read the CSV file
             df = pd.read_csv(source_path)
-            
             if df.empty:
-                logger.warning(f"No data to aggregate for {symbol} {source_timeframe}")
+                logger.error(f"Error: No data in source file {source_path}")
                 return
-                
-            # Convert datetime to pandas datetime
-            df['datetime'] = pd.to_datetime(df['datetime'])
+
+            # Convert timestamp to datetime
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert(self.TIMEZONE)
+
+            # Group by the target timeframe
+            df['group'] = df['datetime'].dt.floor(target_timeframe)
             
-            # Parse target_timeframe to minutes
-            if target_timeframe.endswith('m'):
-                target_minutes = int(target_timeframe.replace('m', ''))
-            elif target_timeframe.endswith('h'):
-                target_minutes = int(target_timeframe.replace('h', '')) * 60
-            else:
-                raise ValueError(f"Unsupported timeframe format: {target_timeframe}")
-            
-            # Create a resampling rule using 'min' instead of 'T'
-            rule = f"{target_minutes}min"
-            
-            # Group by the new timeframe
-            grouped = df.groupby(pd.Grouper(key='datetime', freq=rule))
-            
-            # Aggregate the data
-            agg_df = grouped.agg({
-                'timestamp': 'first',    # Keep the first timestamp
-                'symbol': 'first',       # Keep the symbol
-                'open': 'first',         # First price in the period
-                'high': 'max',           # Highest price in the period
-                'low': 'min',            # Lowest price in the period
-                'close': 'last',         # Last price in the period
-                'volume': 'sum'          # Sum of volume in the period
+            # Aggregate OHLCV data
+            aggregated = df.groupby('group').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
             }).reset_index()
+
+            # Convert back to milliseconds for storage
+            aggregated['timestamp'] = aggregated['group'].astype('int64') // 10**6
+            aggregated = aggregated.drop('group', axis=1)
+
+            # Export to CSV
+            self.export_to_csv(aggregated, symbol, target_timeframe)
             
-            # Drop any rows with NaN values (incomplete periods)
-            agg_df = agg_df.dropna()
+            # Generate inverse data for the aggregated timeframe
+            self.generate_inverse_ohlc(symbol, target_timeframe)
             
-            # Convert datetime back to string format
-            agg_df['datetime'] = agg_df['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Reorder columns
-            columns = ['timestamp', 'datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume']
-            agg_df = agg_df[columns]
-            
-            # Save regular aggregated data
-            target_path = f"data/{target_timeframe}/{symbol}.csv"
-            agg_df.to_csv(target_path, index=False)
-            logger.info(f"Aggregated data exported to {target_path}")
-            
-            # Generate inverse OHLC data
-            df_inverse = agg_df.copy()
-            ohlc_columns = ['open', 'high', 'low', 'close']
-            for col in ohlc_columns:
-                df_inverse[col] = 1 / df_inverse[col]
-            
-            # Save inverse aggregated data with correct naming
-            inverse_path = f"data/{target_timeframe}/{symbol}_inverse.csv"
-            df_inverse.to_csv(inverse_path, index=False)
-            logger.info(f"Inverse aggregated data exported to {inverse_path}")
-            
+            logger.info(f"Successfully aggregated {symbol} from {source_timeframe} to {target_timeframe}")
+
         except Exception as e:
-            logger.error(f"Error aggregating timeframe for {symbol} from {source_timeframe} to {target_timeframe}: {str(e)}")
+            logger.error(f"Error aggregating {symbol} from {source_timeframe} to {target_timeframe}: {str(e)}")
 
     def calculate_indicators(self, symbol: str, timeframe: str) -> None:
         """
@@ -1031,8 +1002,6 @@ class AssetManager:
             candle_time = pd.Timestamp(candle['timestamp'], unit='ms', tz='UTC')
             current_time = pd.Timestamp.now(tz='UTC')
             
-            # Only process if the candle is from the last complete minute
-            last_complete_minute = current_time.floor('min') - pd.Timedelta(minutes=1)
             if candle_time.floor('min') >= current_time.floor('min'):
                 logger.info(f"Skipping incomplete candle for {symbol} at {candle_time}")
                 return
@@ -1082,3 +1051,68 @@ class AssetManager:
         except Exception as e:
             logger.error(f"Error reading inverse data for {symbol} {timeframe}: {str(e)}")
             return pd.DataFrame()
+        
+    def load_symbols_from_file(self, filename: str = 'symbols_to_stream.txt') -> List[str]:
+        """Load symbols to stream from text file"""
+        try:
+            with open(filename, 'r') as f:
+                content = f.read().strip()
+                symbols = [symbol.strip() for symbol in content.split(',') if symbol.strip()]
+                return symbols
+        except FileNotFoundError:
+            print(f"❌ File {filename} not found")
+            return []
+        except Exception as e:
+            print(f"❌ Error reading symbols file: {e}")
+            return []
+            
+    def fetch_historical_data(self):
+        """
+        Fetch historical data for all symbols and timeframes.
+        """
+        try:
+            for symbol in self.symbols:
+                for timeframe in self.timeframes:
+                    logger.info(f"Fetching historical data for {symbol} at {timeframe} timeframe")
+                    self.fetch(symbol, timeframe, 10, "minute")
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {str(e)}")
+
+def main():
+        
+        auth = SchwabAuth()
+        timeframes = ["1m"]
+        """
+        Main Workflow
+        # Get start time for 9:30am ET in current timezone
+        start_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=9, minute=30, second=0, microsecond=0)
+        print(start_time)
+        #Get 4:00pm ET in current timezone
+        end_time = pd.Timestamp.now(tz='US/Eastern').replace(hour=16, minute=0, second=0, microsecond=0)    
+        print(end_time)
+        # Get 9:30am ET in epoch milliseconds
+        start_date = int(start_time.timestamp() * 1000)
+        # Get 4:00pm ET in epoch milliseconds
+        end_date = int(end_time.timestamp() * 1000)
+        # minus one day from start date
+        start_date = start_date - 86400000
+        # minus one day from end date
+        end_date = end_date - 86400000
+        asset_manager = AssetManager(auth, timeframes, start_date, end_date)
+        asset_manager.bootstrap_for_streaming()
+
+        """
+
+        # Fetch historical data
+        start_date = "2025-01-01"
+        # Conver start date to milliseconds in epoch
+        start_date = int(pd.Timestamp(start_date).timestamp() * 1000)
+        end_date = "2025-06-13"
+        # Convert end date to milliseconds in epoch
+        end_date = int(pd.Timestamp(end_date).timestamp() * 1000)
+        asset_manager = AssetManager(auth, timeframes, start_date, end_date)
+        asset_manager.fetch_historical_data()
+
+            
+if __name__ == "__main__":
+    main()
