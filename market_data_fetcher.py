@@ -8,7 +8,7 @@ import time
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List
 from schwab_auth import SchwabAuth
 
 
