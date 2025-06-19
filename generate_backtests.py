@@ -8,8 +8,6 @@ from concurrent.futures import ProcessPoolExecutor
 import time
 from itertools import product
 import multiprocessing
-import numpy as np
-import csv
 
 def get_optimal_workers():
     """
