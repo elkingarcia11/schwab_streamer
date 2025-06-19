@@ -532,12 +532,53 @@ class OptionsManager:
         
         return formatted_symbols
 
-    def stream_options(self, symbol: str, days_to_expiration: int, debug: bool = True):
+    def get_option_symbols_for_multiple_symbols(self, symbols: List[str], days_to_expiration: int) -> Dict[str, Dict[str, List[str]]]:
         """
-        Stream option data for a given symbol and days to expiration using LEVELONE_OPTIONS service.
+        Get option symbols for multiple symbols with the same days to expiration.
         
         Args:
-            symbol (str): The stock symbol (e.g., 'SPY')
+            symbols (List[str]): List of stock symbols (e.g., ['SPY', 'QQQ'])
+            days_to_expiration (int): Minimum number of days to expiration
+            
+        Returns:
+            Dict[str, Dict[str, List[str]]]: Dictionary with symbol as key and 'calls'/'puts' lists as values
+        """
+        all_option_symbols = {}
+        
+        for symbol in symbols:
+            try:
+                print(f"🔍 Processing {symbol}...")
+                
+                # Get expiration date for this symbol
+                expiration_date = self.get_option_expiration(symbol, days_to_expiration)
+                if not expiration_date:
+                    print(f"❌ No suitable expiration date found for {symbol}")
+                    continue
+                
+                print(f"📅 {symbol} expiration date: {expiration_date}")
+                
+                # Get formatted option symbols for this symbol
+                option_symbols = self.get_formatted_option_symbols(symbol, expiration_date)
+                
+                if not option_symbols['calls'] and not option_symbols['puts']:
+                    print(f"❌ No option symbols found for {symbol}")
+                    continue
+                
+                all_option_symbols[symbol] = option_symbols
+                print(f"✅ {symbol}: {len(option_symbols['calls'])} calls, {len(option_symbols['puts'])} puts")
+                
+            except Exception as e:
+                print(f"❌ Error processing {symbol}: {e}")
+                continue
+        
+        return all_option_symbols
+
+    def stream_multiple_symbols_options(self, symbols: List[str], days_to_expiration: int, debug: bool = True):
+        """
+        Stream option data for multiple symbols with the same days to expiration.
+        
+        Args:
+            symbols (List[str]): List of stock symbols (e.g., ['SPY', 'QQQ'])
             days_to_expiration (int): Minimum number of days to expiration
             debug (bool): Whether to enable debug mode for streaming
         """
@@ -545,50 +586,60 @@ class OptionsManager:
             # Ensure data directory exists
             self.ensure_options_data_directory()
             
-            # Get expiration date
-            expiration_date = self.get_option_expiration(symbol, days_to_expiration)
-            if not expiration_date:
-                print(f"❌ No suitable expiration date found for {symbol}")
+            print(f"🚀 Starting option streaming for {len(symbols)} symbols: {', '.join(symbols)}")
+            
+            # Get option symbols for all symbols
+            all_option_symbols = self.get_option_symbols_for_multiple_symbols(symbols, days_to_expiration)
+            
+            if not all_option_symbols:
+                print("❌ No option symbols found for any symbol")
                 return
             
-            print(f"📅 Using expiration date: {expiration_date}")
+            # Collect all option symbols from all symbols
+            all_option_symbols_flat = []
+            symbol_mapping = {}  # Map option symbol back to original symbol
             
-            # Get formatted option symbols for streaming
-            option_symbols = self.get_formatted_option_symbols(symbol, expiration_date)
+            for symbol, option_data in all_option_symbols.items():
+                calls = option_data['calls']
+                puts = option_data['puts']
+                
+                # Add calls and puts to flat list
+                for call_symbol in calls:
+                    all_option_symbols_flat.append(call_symbol)
+                    symbol_mapping[call_symbol] = symbol
+                
+                for put_symbol in puts:
+                    all_option_symbols_flat.append(put_symbol)
+                    symbol_mapping[put_symbol] = symbol
+                
+                print(f"📊 {symbol}: {len(calls)} calls + {len(puts)} puts = {len(calls) + len(puts)} total options")
             
-            if not option_symbols['calls'] and not option_symbols['puts']:
-                print(f"❌ No option symbols found for {symbol}")
-                return
-            
-            print(f"📊 Found {len(option_symbols['calls'])} call options and {len(option_symbols['puts'])} put options")
-            print(f"📋 Call symbols: {option_symbols['calls']}")
-            print(f"📋 Put symbols: {option_symbols['puts']}")
+            print(f"📋 Total option symbols to stream: {len(all_option_symbols_flat)}")
             
             # Initialize streaming client
             self.streamer_client = SchwabStreamerClient(debug=debug)
             
-            # Set the formatted option symbols as tracked symbols
-            all_option_symbols = option_symbols['calls'] + option_symbols['puts']
-            self.streamer_client.tracked_symbols = all_option_symbols
+            # Set all option symbols as tracked symbols
+            self.streamer_client.tracked_symbols = all_option_symbols_flat
             
             # Initialize CSV writers for all option symbols
-            for option_symbol in all_option_symbols:
+            for option_symbol in all_option_symbols_flat:
                 self.initialize_csv_writer(option_symbol)
             
-            print(f"🔗 Connecting to streaming service for {len(all_option_symbols)} option symbols...")
+            print(f"🔗 Connecting to streaming service for {len(all_option_symbols_flat)} option symbols...")
             
             # Connect and start streaming
             self.streamer_client.connect()
             
             # Keep the script running
-            print("📈 Streaming option data. Press Ctrl+C to stop.")
+            print("📈 Streaming option data for multiple symbols. Press Ctrl+C to stop.")
             while True:
                 time.sleep(1)
                 
         except KeyboardInterrupt:
-            print("\n🛑 Stopping option stream...")
+            print("\n🛑 Stopping multi-symbol option stream...")
         except Exception as e:
-            print(f"❌ Error in option streaming: {e}")
+            print(f"❌ Error in multi-symbol option streaming: {e}")
         finally:
             # Clean up
             self.close_csv_files()
@@ -596,33 +647,35 @@ class OptionsManager:
                 self.streamer_client.disconnect()
                 print("🔌 Disconnected from streaming service")
 
-    def stop_streaming(self):
-        """Stop the current option streaming session."""
-        self.close_csv_files()
-        if self.streamer_client:
-            self.streamer_client.disconnect()
-            print("🔌 Option streaming stopped")
+    def stream_options(self, symbol: str, days_to_expiration: int, debug: bool = True):
+        """
+        Stream option data for a single symbol and days to expiration using LEVELONE_OPTIONS service.
+        
+        Args:
+            symbol (str): The stock symbol (e.g., 'SPY')
+            days_to_expiration (int): Minimum number of days to expiration
+            debug (bool): Whether to enable debug mode for streaming
+        """
+        # Use the multi-symbol function with a single symbol
+        self.stream_multiple_symbols_options([symbol], days_to_expiration, debug)
 
 if __name__ == "__main__":
-    # Example usage
-    symbol = "SPY"
+    # Example usage with multiple symbols
+    symbols = ["SPY", "QQQ"]  # Add more symbols as needed
     days = 5
     
     options_manager = OptionsManager()
     
-    # Get expiration date and option symbols
-    expiration_date = options_manager.get_option_expiration(symbol, days)
-    if expiration_date:
-        print(f"Found expiration date for {symbol} with minimum {days} days to expiration: {expiration_date}")
-        
-        # Get option symbols
-        option_symbols = options_manager.get_option_symbols(symbol, expiration_date)
-        print(f"\nOption symbols for {symbol} expiring {expiration_date}:")
-        print(f"Calls: {option_symbols['calls']}")
-        print(f"Puts: {option_symbols['puts']}")
-        
-        # Start streaming
-        print(f"\n🚀 Starting option streaming...")
-        options_manager.stream_options(symbol, days)
-    else:
-        print(f"No suitable expiration date found for {symbol}") 
+    # Option 1: Stream multiple symbols
+    print("🚀 Starting multi-symbol option streaming...")
+    options_manager.stream_multiple_symbols_options(symbols, days)
+    
+    # Option 2: Stream single symbol (still works)
+    # options_manager.stream_options("SPY", days)
+    
+    # Option 3: Get option symbols without streaming
+    # all_option_symbols = options_manager.get_option_symbols_for_multiple_symbols(symbols, days)
+    # for symbol, option_data in all_option_symbols.items():
+    #     print(f"\n{symbol} options:")
+    #     print(f"Calls: {option_data['calls']}")
+    #     print(f"Puts: {option_data['puts']}") 
