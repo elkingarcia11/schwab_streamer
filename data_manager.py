@@ -94,6 +94,7 @@ from typing import List, Dict, Optional, Tuple
 from schwab_auth import SchwabAuth
 from indicator_generator import IndicatorGenerator
 from signal_processor import SignalProcessor
+import urllib.parse
 
 
 class DataManager:
@@ -154,11 +155,8 @@ class DataManager:
         """
         valid_periods = [1, 2, 3, 4, 5, 10]
         
-        # Determine default period based on timeframe
-        if timeframe == '1m':
-            default_period = 1
-        else:
-            default_period = 10
+        # Use period=10 for better compatibility with the API
+        default_period = 10
         
         # Find the largest valid period that fits within our date range
         # If default_period fits, use it; otherwise use the largest available
@@ -178,19 +176,7 @@ class DataManager:
         now_et = datetime.now(self.et_tz)
         today_et = now_et.date()
         
-        # If it's before market open today, use yesterday's close
-        if now_et.time() < self.market_open:
-            yesterday_et = today_et - timedelta(days=1)
-            yesterday_close = datetime.combine(yesterday_et, self.market_close)
-            return self.et_tz.localize(yesterday_close)
-        
-        # If it's during market hours, get the last completed interval
-        if self.market_open <= now_et.time() <= self.market_close:
-            # For now, return current time rounded down to nearest minute
-            # In a real implementation, you'd want to round to the nearest interval
-            return now_et.replace(second=0, microsecond=0)
-        
-        # If it's after market close, use today's close
+        # Use today's market close time in ET timezone
         today_close = datetime.combine(today_et, self.market_close)
         return self.et_tz.localize(today_close)
 
@@ -262,6 +248,15 @@ class DataManager:
             print("❌ No valid authentication headers available")
             return None
 
+        # Debug: Print headers (masking sensitive values)
+        debug_headers = {}
+        for key, value in headers.items():
+            if 'authorization' in key.lower() or 'token' in key.lower():
+                debug_headers[key] = f"{value[:20]}..." if len(value) > 20 else "***"
+            else:
+                debug_headers[key] = value
+        print(f"  [DEBUG] Request Headers: {debug_headers}")
+
         url = "https://api.schwabapi.com/marketdata/v1/pricehistory"
 
         all_candles = []
@@ -278,11 +273,25 @@ class DataManager:
             current_end_dt = min(current_start_dt + timedelta(days=period-1), end_date)
 
             # Convert start and end dates to UNIX epoch milliseconds
+            # Ensure datetime objects are timezone-aware before conversion
+            if current_start_dt.tzinfo is None:
+                current_start_dt = self.et_tz.localize(current_start_dt)
+            if current_end_dt.tzinfo is None:
+                current_end_dt = self.et_tz.localize(current_end_dt)
+
+            # Print ET and UTC datetimes and ms epoch for debugging
+            print(f"  [DEBUG] Start (ET): {current_start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"  [DEBUG] End   (ET): {current_end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"  [DEBUG] Start (UTC): {current_start_dt.astimezone(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"  [DEBUG] End   (UTC): {current_end_dt.astimezone(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            print(f"  [DEBUG] Start ms epoch: {int(current_start_dt.timestamp() * 1000)}")
+            print(f"  [DEBUG] End   ms epoch: {int(current_end_dt.timestamp() * 1000)}")
+
             start_time_ms = int(current_start_dt.timestamp() * 1000)
             end_time_ms = int(current_end_dt.timestamp() * 1000)
 
             params = {
-                'symbol': symbol,
+                'symbol': symbol,  # Use single symbol parameter to match working URL
                 'periodType': 'day',
                 'period': period,
                 'frequencyType': 'minute',
@@ -293,6 +302,11 @@ class DataManager:
                 'needPreviousClose': 'false'
             }
 
+            # Debug: Print the exact URL and parameters
+            query_string = urllib.parse.urlencode(params)
+            debug_url = f"{url}?{query_string}"
+            print(f"  [DEBUG] API URL: {debug_url}")
+
             print(f"📡 Fetching price history for {symbol} ({interval_to_fetch}m) from {current_start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} to {current_end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} (period={period})")
 
             try:
@@ -300,15 +314,35 @@ class DataManager:
                 # Sleep for 1 second to avoid rate limiting
                 time.sleep(1)
 
+                # Debug: Print response details
+                print(f"  [DEBUG] Response Status: {response.status_code}")
+                print(f"  [DEBUG] Response Headers: {dict(response.headers)}")
+                
+                # Parse and print error details if it's a JSON response
+                try:
+                    error_data = response.json()
+                    if 'errors' in error_data:
+                        print(f"  [DEBUG] API Errors:")
+                        for error in error_data['errors']:
+                            title = error.get('title', 'Unknown')
+                            detail = error.get('detail', 'No detail provided')
+                            print(f"    Title: {title}")
+                            print(f"    Detail: {detail}")
+                except:
+                    print(f"  [DEBUG] Full Response Text: {response.text}")
+
                 if response.status_code == 200:
                     data = response.json()
-
+                    print(f"  [DEBUG] Success! Response data keys: {list(data.keys())}")
+                    
                     if 'candles' in data and data['candles']:
                         candles = data['candles']
                         print(f"✅ Retrieved {len(candles)} candles from Schwab API")
+                        print(f"  [DEBUG] First candle: {candles[0] if candles else 'None'}")
                         all_candles.extend(candles)
                     else:
                         print("📊 No candle data found in API response")
+                        print(f"  [DEBUG] Full response data: {data}")
                 else:
                     print(f"❌ API request failed: {response.status_code}")
                     if response.text:
@@ -361,11 +395,11 @@ class DataManager:
             print(f"⚠️  No data retrieved for {symbol}_{interval_to_fetch}m")
             return None
 
-    def fetchLatest(self, symbol: str, timeframe: str, 
-                   ema_period: int = None, vwma_period: int = None, roc_period: int = None,
-                   fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+    def _fetch_base_symbol_data(self, symbol: str, timeframe: str, 
+                               ema_period: int = None, vwma_period: int = None, roc_period: int = None,
+                               fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
         """
-        Fetch the latest data for a symbol and timeframe with incremental updates
+        Fetch the latest data for a base symbol (not inverse) with incremental updates
         
         Args:
             symbol: Stock symbol (e.g., 'SPY')
@@ -380,15 +414,10 @@ class DataManager:
         Returns:
             DataFrame with latest data and indicators, or None if failed
         """
-        if timeframe not in self.valid_timeframes:
-            print(f"❌ Invalid timeframe: {timeframe}. Valid timeframes: {self.valid_timeframes}")
-            return None
-            
-        symbol = symbol.upper()
         df_key = self._get_df_key(symbol, timeframe)
         interval_minutes = self._extract_frequency_number(timeframe)
         
-        print(f"🔄 Fetching latest data for {symbol} {timeframe}")
+        print(f"🔄 Fetching base symbol data for {symbol} {timeframe}")
         
         # Check if DataFrame exists in memory
         if df_key in self.latestDF and len(self.latestDF[df_key]) > 0:
@@ -531,6 +560,68 @@ class DataManager:
                     print(f"❌ Failed to fetch initial data for {symbol} {timeframe}")
                     return None
 
+    def fetchLatest(self, symbol: str, timeframe: str, 
+                   ema_period: int = None, vwma_period: int = None, roc_period: int = None,
+                   fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+        """
+        Fetch the latest data for a symbol and timeframe with incremental updates
+        
+        Args:
+            symbol: Stock symbol (e.g., 'SPY' or 'SPY_inverse')
+            timeframe: Timeframe (e.g., '1m', '5m', '10m', '15m', '30m')
+            ema_period: EMA period for indicators
+            vwma_period: VWMA period for indicators
+            roc_period: ROC period for indicators
+            fast_ema: Fast EMA for MACD
+            slow_ema: Slow EMA for MACD
+            signal_ema: Signal EMA for MACD
+            
+        Returns:
+            DataFrame with latest data and indicators, or None if failed
+        """
+        if timeframe not in self.valid_timeframes:
+            print(f"❌ Invalid timeframe: {timeframe}. Valid timeframes: {self.valid_timeframes}")
+            return None
+            
+        # Check if this is an inverse symbol
+        is_inverse = symbol.endswith('_inverse')
+        base_symbol = symbol.replace('_inverse', '') if is_inverse else symbol
+        
+        symbol = symbol.upper()
+        base_symbol = base_symbol.upper()
+        
+        print(f"🔄 Fetching latest data for {symbol} {timeframe} (inverse: {is_inverse})")
+        
+        # For inverse symbols, fetch the base symbol data first
+        if is_inverse:
+            # Fetch base symbol data
+            base_df = self._fetch_base_symbol_data(base_symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+            
+            if base_df is not None and len(base_df) > 0:
+                # Generate inverse data
+                inverse_df = self._generate_inverse_data(base_df)
+                
+                # Calculate indicators for inverse data
+                result_df = self.indicator_generator.smart_indicator_calculation(
+                    symbol, timeframe, inverse_df, None,
+                    ema_period, vwma_period, roc_period,
+                    fast_ema, slow_ema, signal_ema
+                )
+                
+                # Save inverse data
+                self._save_df_to_csv(result_df, symbol, timeframe)
+                df_key = self._get_df_key(symbol, timeframe)
+                self.latestDF[df_key] = result_df
+                
+                print(f"✅ Generated inverse data for {symbol} {timeframe} with {len(result_df)} records")
+                return result_df
+            else:
+                print(f"❌ Failed to fetch base symbol data for {base_symbol}")
+                return None
+        else:
+            # Regular symbol - use existing logic
+            return self._fetch_base_symbol_data(symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+
     def reset_memory(self, symbol: str = None, timeframe: str = None):
         """
         Reset the in-memory DataFrame cache
@@ -565,7 +656,7 @@ class DataManager:
         Fetch the latest data for a symbol and timeframe with incremental updates and process trading signals
         
         Args:
-            symbol: Stock symbol (e.g., 'SPY')
+            symbol: Stock symbol (e.g., 'SPY') - will also process 'SPY_inverse'
             timeframe: Timeframe (e.g., '1m', '5m', '10m', '15m', '30m')
             ema_period: EMA period for indicators
             vwma_period: VWMA period for indicators
@@ -577,17 +668,25 @@ class DataManager:
         Returns:
             DataFrame with latest data and indicators, or None if failed
         """
+        # Fetch data for original symbol
         result_df = self.fetchLatest(symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
         
+        # Fetch data for inverse symbol
+        inverse_symbol = f"{symbol}_inverse"
+        result_df_inverse = self.fetchLatest(inverse_symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+        
         if result_df is not None:
-            # Process trading signals for the data
+            # Process trading signals for the original symbol
             self.process_signals(symbol, timeframe, result_df)
-            
             print(f"✅ Processed signals for {symbol} {timeframe}")
-            return result_df
-        else:
-            print(f"❌ Failed to fetch data for {symbol} {timeframe}")
-            return None
+            
+        if result_df_inverse is not None:
+            # Process trading signals for the inverse symbol
+            self.process_signals(inverse_symbol, timeframe, result_df_inverse)
+            print(f"✅ Processed signals for {inverse_symbol} {timeframe}")
+            
+        # Return the original symbol's data (for backward compatibility)
+        return result_df
             
     def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame) -> List:
         """
@@ -615,8 +714,19 @@ class DataManager:
         Returns:
             Optional[Trade]: New trade if opened, None otherwise
         """
-        return self.signal_processor.process_latest_signal(symbol, timeframe, row)
-
+        # Process signal for original symbol
+        original_trade = self.signal_processor.process_latest_signal(symbol, timeframe, row)
+        
+        # Generate inverse data from the original row
+        inverse_row = self._generate_inverse_row(row)
+        
+        # Process signal for inverse symbol
+        inverse_symbol = f"{symbol}_inverse"
+        inverse_trade = self.signal_processor.process_latest_signal(inverse_symbol, timeframe, inverse_row)
+        
+        # Return the original trade for backward compatibility
+        return original_trade
+        
     def get_trade_summary(self) -> Dict[str, float]:
         """Get a summary of trading signals and performance"""
         return self.signal_processor.get_trade_summary()
@@ -668,11 +778,11 @@ class DataManager:
             symbol: Specific symbol to reset (if None, reset all)
             timeframe: Specific timeframe to reset (if None, reset all for symbol)
         """
-        if symbol is None:
+        if not symbol:
             # Reset all trades
             self.signal_processor = SignalProcessor()
             print("🔄 Reset all trades")
-        elif timeframe is None:
+        elif not timeframe:
             # Reset all timeframes for symbol
             symbol = symbol.upper()
             # This would require more complex logic to reset specific symbol trades
@@ -681,6 +791,39 @@ class DataManager:
             # Reset specific symbol/timeframe
             symbol = symbol.upper()
             print(f"🔄 Reset trades for {symbol} {timeframe}")
+
+    def _generate_inverse_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate inverse OHLC data from original symbol data.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with inverse OHLC data (1/price) and same volume/timestamps
+        """
+        if df is None or len(df) == 0:
+            return df
+            
+        inverse_df = df.copy()
+        
+        # Generate inverse prices (1/price)
+        inverse_df['open'] = 1.0 / df['open']
+        inverse_df['high'] = 1.0 / df['high']
+        inverse_df['low'] = 1.0 / df['low']
+        inverse_df['close'] = 1.0 / df['close']
+        
+        # Note: For inverse data, we need to swap high/low since 1/high < 1/low
+        # when original high > low
+        temp_high = inverse_df['high'].copy()
+        inverse_df['high'] = inverse_df['low']
+        inverse_df['low'] = temp_high
+        
+        # Keep volume and timestamps the same
+        # (volume and timestamp columns remain unchanged)
+        
+        print(f"🔄 Generated inverse data with {len(inverse_df)} rows")
+        return inverse_df
 
 
 if __name__ == "__main__":
@@ -695,7 +838,7 @@ if __name__ == "__main__":
     slow_ema = 26
     signal_ema = 9
     
-    # Fetch data and process signals automatically
+    # Fetch data and process signals automatically for both SPY and SPY_inverse
     result = data_manager.fetchLatestWithSignals(
         "SPY", "5m",
         ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
@@ -704,11 +847,25 @@ if __name__ == "__main__":
     
     if result is not None:
         print(f"✅ Successfully fetched {len(result)} records for SPY 5m")
-        print("Last row:")
+        print("Last row of SPY:")
         print(result.tail(1))
         
-        # Get trade summary
+        # Check if inverse data was also generated
+        inverse_df = data_manager.latestDF.get("SPY_INVERSE_5m")
+        if inverse_df is not None:
+            print(f"✅ Successfully generated {len(inverse_df)} records for SPY_inverse 5m")
+            print("Last row of SPY_inverse:")
+            print(inverse_df.tail(1))
+        
+        # Get trade summary (includes both original and inverse trades)
         summary = data_manager.get_trade_summary()
-        print(f"Win Rate: {summary['win_rate']:.1f}%")
+        print(f"📊 Trade Summary - Win Rate: {summary['win_rate']:.1f}%")
+        print(f"📊 Total Trades: {summary['total_trades']} (includes both original and inverse)")
+        
+        # Get open trades
+        open_trades = data_manager.get_open_trades()
+        print(f"📊 Open Trades: {len(open_trades)}")
+        for key, trade in open_trades.items():
+            print(f"  {trade.symbol} {trade.timeframe}: Entry {trade.entry_price:.2f}, P&L {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
     else:
         print("❌ Failed to fetch data")
