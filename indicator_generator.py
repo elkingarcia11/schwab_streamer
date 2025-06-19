@@ -1,6 +1,14 @@
 """
 Indicator Generator Module
 The Indicator Generator module handles three primary use cases: initial historical data processing (using efficient bulk vectorized operations), additional data processing (using incremental calculations that build on existing state), and real-time data processing (using single-point incremental updates). It calculates common technical indicators including Exponential Moving Averages (EMA), Volume Weighted Moving Averages (VWMA), Rate of Change (ROC), and MACD (Moving Average Convergence Divergence) with customizable periods. The system features automatic state persistence and seamless recovery of calculation state after program restarts, and smart auto-detection that chooses bulk processing for initial data and incremental processing for additional data. All calculations are performed in-memory for optimal performance while maintaining data continuity across sessions, making it suitable for both historical backtesting and real-time trading applications.
+
+Key Features:
+- smart_indicator_calculation(): Unified API for both bulk and incremental processing
+- Pure in-memory processing with no CSV dependencies (handled externally)
+- Robust state management with automatic persistence and recovery
+- Flexible API that handles None, empty DataFrames, and valid data
+- Seamless continuity between bulk and incremental calculations
+- Optimized for both historical backtesting and real-time trading
 """
 import pandas as pd
 import numpy as np
