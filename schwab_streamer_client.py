@@ -15,9 +15,9 @@ import threading
 import httpx
 import websocket
 import requests
-from market_data_fetcher import MarketDataFetcher
-from generate_indicators import IndicatorGenerator
-from generate_backtests import BacktestStrategy
+from data_manager import MarketDataFetcher
+from indicator_generator import IndicatorGenerator
+from backtest_generator import BacktestStrategy
 import pandas as pd
 import os
 import time

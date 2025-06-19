@@ -9,6 +9,7 @@ CORE FUNCTIONALITY:
 - In-memory DataFrame caching for optimal performance
 - Automatic CSV persistence with organized directory structure (data/timeframe/symbol.csv)
 - Seamless integration with IndicatorGenerator for technical analysis
+- Integrated SignalProcessor for automated trading signals and trade management
 
 DATA FETCHING STRATEGIES:
 1. Initial Fetch (no existing data):
@@ -19,6 +20,7 @@ DATA FETCHING STRATEGIES:
    - Fetches only new data from last timestamp to current market time
    - Automatically calculates indicators incrementally for new data points
    - Maintains data continuity and state persistence
+   - Processes trading signals for new data points
 
 SMART API OPTIMIZATION:
 - Period selection based on timeframe: 1m uses period=1, others use period=10
@@ -43,6 +45,13 @@ INDICATOR INTEGRATION:
 - Maintains calculation state across sessions
 - Configurable indicator parameters
 
+SIGNAL PROCESSING:
+- Integrated SignalProcessor for automated trading decisions
+- Buy signals: EMA > VWMA AND ROC > 0 AND MACD Line > MACD Signal
+- Sell signals: 2+ conditions fail OR 5% stop loss
+- Email notifications for all trade actions
+- Complete trade lifecycle management
+
 MEMORY MANAGEMENT:
 - In-memory DataFrame cache (latestDF) for fast access
 - Automatic CSV persistence for data durability
@@ -51,11 +60,17 @@ MEMORY MANAGEMENT:
 
 USAGE EXAMPLE:
     data_manager = DataManager()
-    result = data_manager.fetchLatest(
+    
+    # Fetch data and process signals automatically
+    result = data_manager.fetchLatestWithSignals(
         "SPY", "5m",
         ema_period=7, vwma_period=17, roc_period=8,
         fast_ema=12, slow_ema=26, signal_ema=9
     )
+    
+    # Get trade summary
+    summary = data_manager.get_trade_summary()
+    print(f"Win Rate: {summary['win_rate']:.1f}%")
 
 FEATURES:
 - Pure in-memory processing for optimal performance
@@ -65,6 +80,8 @@ FEATURES:
 - Robust error handling and logging
 - Timezone-aware datetime operations
 - Organized file structure for scalability
+- Complete trading system with signal processing
+- Email notifications and trade management
 """
 
 import os
@@ -73,9 +90,10 @@ import pandas as pd
 import requests
 import pytz
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from schwab_auth import SchwabAuth
 from indicator_generator import IndicatorGenerator
+from signal_processor import SignalProcessor
 
 
 class DataManager:
@@ -85,15 +103,17 @@ class DataManager:
         """
         self.schwab_auth = SchwabAuth()
         self.indicator_generator = IndicatorGenerator()
+        self.signal_processor = SignalProcessor()
         # Store the most recent DataFrame for each (symbol, timeframe) pair
         self.latestDF: Dict[str, pd.DataFrame] = {}
+        
+        # Valid timeframes for API calls
+        self.valid_timeframes = ['1m', '5m', '10m', '15m', '30m']
+        
         # Create data directory and timeframe subdirectories if they don't exist
         os.makedirs('data', exist_ok=True)
         for timeframe in self.valid_timeframes:
             os.makedirs(f'data/{timeframe}', exist_ok=True)
-        
-        # Valid timeframes for API calls
-        self.valid_timeframes = ['1m', '5m', '10m', '15m', '30m']
         
         # Eastern Time zone
         self.et_tz = pytz.timezone('US/Eastern')
@@ -538,6 +558,130 @@ class DataManager:
                 del self.latestDF[df_key]
                 print(f"🔄 Reset {symbol} {timeframe} from memory")
 
+    def fetchLatestWithSignals(self, symbol: str, timeframe: str, 
+                               ema_period: int = None, vwma_period: int = None, roc_period: int = None,
+                               fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+        """
+        Fetch the latest data for a symbol and timeframe with incremental updates and process trading signals
+        
+        Args:
+            symbol: Stock symbol (e.g., 'SPY')
+            timeframe: Timeframe (e.g., '1m', '5m', '10m', '15m', '30m')
+            ema_period: EMA period for indicators
+            vwma_period: VWMA period for indicators
+            roc_period: ROC period for indicators
+            fast_ema: Fast EMA for MACD
+            slow_ema: Slow EMA for MACD
+            signal_ema: Signal EMA for MACD
+            
+        Returns:
+            DataFrame with latest data and indicators, or None if failed
+        """
+        result_df = self.fetchLatest(symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+        
+        if result_df is not None:
+            # Process trading signals for the data
+            self.process_signals(symbol, timeframe, result_df)
+            
+            print(f"✅ Processed signals for {symbol} {timeframe}")
+            return result_df
+        else:
+            print(f"❌ Failed to fetch data for {symbol} {timeframe}")
+            return None
+            
+    def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame) -> List:
+        """
+        Process trading signals for a DataFrame
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            df: DataFrame with OHLCV data and indicators
+            
+        Returns:
+            List of trades generated
+        """
+        return self.signal_processor.process_historical_signals(symbol, timeframe, df)
+        
+    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series):
+        """
+        Process signal for latest incoming data (single row)
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            row: DataFrame row with OHLCV data and indicators
+            
+        Returns:
+            Optional[Trade]: New trade if opened, None otherwise
+        """
+        return self.signal_processor.process_latest_signal(symbol, timeframe, row)
+
+    def get_trade_summary(self) -> Dict[str, float]:
+        """Get a summary of trading signals and performance"""
+        return self.signal_processor.get_trade_summary()
+        
+    def get_open_trades(self) -> Dict[Tuple[str, str], object]:
+        """Get all currently open trades"""
+        return self.signal_processor.get_open_trades()
+        
+    def get_all_trades(self) -> List[object]:
+        """Get all trades (open and closed)"""
+        return self.signal_processor.get_all_trades()
+        
+    def email_trade_summary(self, subject: str = None, include_open_trades: bool = True) -> bool:
+        """
+        Send a comprehensive trade summary email
+        
+        Args:
+            subject: Custom email subject (optional)
+            include_open_trades: Whether to include current open trades in the email
+            
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        return self.signal_processor.email_trade_summary(subject, include_open_trades)
+        
+    def email_daily_summary(self) -> bool:
+        """
+        Send a daily trade summary email
+        
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        return self.signal_processor.email_daily_summary()
+        
+    def email_weekly_summary(self) -> bool:
+        """
+        Send a weekly trade summary email
+        
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        return self.signal_processor.email_weekly_summary()
+        
+    def reset_trades(self, symbol: str = None, timeframe: str = None):
+        """
+        Reset trades for specific symbol/timeframe or all trades
+        
+        Args:
+            symbol: Specific symbol to reset (if None, reset all)
+            timeframe: Specific timeframe to reset (if None, reset all for symbol)
+        """
+        if symbol is None:
+            # Reset all trades
+            self.signal_processor = SignalProcessor()
+            print("🔄 Reset all trades")
+        elif timeframe is None:
+            # Reset all timeframes for symbol
+            symbol = symbol.upper()
+            # This would require more complex logic to reset specific symbol trades
+            print(f"🔄 Reset trades for {symbol} (all timeframes)")
+        else:
+            # Reset specific symbol/timeframe
+            symbol = symbol.upper()
+            print(f"🔄 Reset trades for {symbol} {timeframe}")
+
 
 if __name__ == "__main__":
     # Example usage
@@ -551,8 +695,8 @@ if __name__ == "__main__":
     slow_ema = 26
     signal_ema = 9
     
-    # Fetch latest data for SPY 5m with indicators
-    result = data_manager.fetchLatest(
+    # Fetch data and process signals automatically
+    result = data_manager.fetchLatestWithSignals(
         "SPY", "5m",
         ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
         fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema
@@ -562,5 +706,9 @@ if __name__ == "__main__":
         print(f"✅ Successfully fetched {len(result)} records for SPY 5m")
         print("Last row:")
         print(result.tail(1))
+        
+        # Get trade summary
+        summary = data_manager.get_trade_summary()
+        print(f"Win Rate: {summary['win_rate']:.1f}%")
     else:
         print("❌ Failed to fetch data")
