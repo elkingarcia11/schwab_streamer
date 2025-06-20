@@ -128,6 +128,32 @@ class DataManager:
         self.market_open = datetime.strptime('09:30', '%H:%M').time()
         self.market_close = datetime.strptime('16:00', '%H:%M').time()
 
+        # Load dataframes from csv files
+        for symbol in self.symbols:
+            for timeframe in self.timeframes:
+                # Load from csv files or create new one
+                df = self.initialize_dataframe(symbol, timeframe)
+                self.indicator_generator.initialize_indicators_state(symbol, timeframe, df)
+
+    def initialize_dataframe(self, symbol: str, timeframe: str):
+        df = self._load_df_from_csv(symbol, timeframe)
+        if df is None:
+            df = pd.DataFrame(columns=['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume'])
+        self.latestDF[(symbol, timeframe)] = df
+        return df 
+
+    def fetchDF(self, symbol: str, timeframe: str):
+        """Fetch the latest DataFrame for a given symbol and timeframe"""
+        df = self.latestDF[(symbol, timeframe)]
+        # Load existing DataFrame or create new one
+        if df is None:
+            # Load from CSV if exists
+            df = self._load_df_from_csv(symbol, timeframe)
+            if df is None or df.empty:
+                # Create new DataFrame with proper columns (matching CSV structure)
+                df = pd.DataFrame(columns=['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume'])
+            self.latestDF[(symbol, timeframe)] = df
+        return df
     
     def _extract_frequency_number(self, interval) -> int:
         """Extract numeric frequency from interval string (e.g., '5m' -> 5) or return int if already int"""
@@ -1276,6 +1302,30 @@ class DataManager:
         
         print("🎉 Data Manager execution completed!")
     
+    def get_comma_separated_items_from_file(self, filepath: str) -> List[str]:
+        """Get comma-separated items from file (e.g., symbols or timeframes)"""
+        try:
+            with open(filepath, 'r') as file:
+                content = file.read().strip()
+                
+                # Split by comma and clean up each item
+                items = [item.strip().upper() for item in content.split(',') if item.strip()]
+                return items
+        except FileNotFoundError:
+            print(f"⚠️ File not found: {filepath}")
+            return []
+        except Exception as e:
+            print(f"❌ Error reading file {filepath}: {e}")
+            return []
+
+    def get_symbols_from_file(self, symbols_filepath: str) -> List[str]:
+        """Get symbols from file (alias for get_comma_separated_items_from_file)"""
+        return self.get_comma_separated_items_from_file(symbols_filepath)
+
+    def get_timeframes_from_file(self, timeframes_filepath: str) -> List[str]:
+        """Get timeframes from file (alias for get_comma_separated_items_from_file)"""
+        return self.get_comma_separated_items_from_file(timeframes_filepath)
+
 def main():
     data_manager = DataManager()
     data_manager.bootstrap()
