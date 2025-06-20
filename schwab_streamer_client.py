@@ -3,26 +3,38 @@ This file contains the SchwabStreamerClient class, which is used to connect to t
 
 It also contains the parse_chart_data function, which is used to parse the CHART_EQUITY data into a dictionary.
 
-It also contains the parse_option_streaming_data function, which is used to parse the LEVELONE_OPTIONS data into a dictionary.
-
 It also contains the get_user_preferences function, which is used to get the user preferences from the Schwab API.
 """
-from typing import List
 import json
 import time
 import threading
 import httpx
 import websocket
-from data_manager import DataManager
-import pandas as pd
 import os
 import time
-from options_manager import OptionsManager
+import pandas as pd
+from typing import List
+from data_manager import DataManager
+from schwab_auth import SchwabAuth
 
 class SchwabStreamerClient:
     """Main client for Schwab Streaming API - OHLCV Data Collection"""
     
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, symbols_filepath: str = 'symbols.txt', timeframes_filepath: str = 'timeframe.txt'):
+        # Create data directory if it doesn't exist
+        os.makedirs('data', exist_ok=True)
+        self.schwab_auth = SchwabAuth()
+        # Read equity symbols from file path, timeframe from file path
+        self.equity_symbols = self.get_symbols_from_file(symbols_filepath)
+        self.timeframes = self.get_timeframes_from_file(timeframes_filepath)
+        self.data_manager = DataManager(self.schwab_auth, self.equity_symbols, self.timeframes)
+
+        self.daily_email_sent = False  # Track if 4pm email was sent today
+        
+        # Candle aggregation buffers for higher timeframes
+        self.candle_buffers = {}  # Store 1m candles for aggregation
+        self.last_aggregation_times = {}  # Track when we last aggregated for each timeframe
+        
         self.debug = debug
         self.ws = None
         self.running = False
@@ -31,23 +43,6 @@ class SchwabStreamerClient:
         self.subscriptions = {}
         self.message_handlers = {}
         self.streamer_info = None  # Store streamer info for subscription requests
-        
-        self.data_manager = DataManager()
-        self.auth = self.data_manager.schwab_auth
-        # Initialize the new modules
-        self.options_manager = OptionsManager(self.auth)
-
-        self.tracked_symbols = self.data_manager.symbols
-        self.timeframes = self.data_manager.timeframes
-
-        self.daily_email_sent = False  # Track if 4pm email was sent today
-        
-        # Candle aggregation buffers for higher timeframes
-        self.candle_buffers = {}  # Store 1m candles for aggregation
-        self.last_aggregation_times = {}  # Track when we last aggregated for each timeframe
-        
-        # Create data directory if it doesn't exist
-        os.makedirs('data', exist_ok=True)
         
         # Get user preferences and store SchwabClientCustomerId
         self.user_preferences = self.get_user_preferences()
@@ -73,230 +68,54 @@ class SchwabStreamerClient:
             7: 'time',       # Chart Time - Milliseconds since Epoch
             8: 'chart_day'   # Chart Day
         }
-        
-        # Example: fetch option symbols to track (calls+puts for all tracked symbols, 7 DTE)
-        self.option_symbols_to_track = ["SPY", "QQQ"]
-        option_symbols_dict = self.options_manager.get_option_symbols_for_multiple_symbols(self.option_symbols_to_track, days_to_expiration=0)
-        for symbol, d in option_symbols_dict.items():
-            self.option_symbols_to_track.extend(d['calls'])
-            self.option_symbols_to_track.extend(d['puts'])
     
-    def get_user_preferences(self):
-        """Get user preferences using the SchwabAuth token"""
-        try:
-            # Get fresh token
-            access_token = self.auth.get_access_token()
-            if not access_token:
-                raise Exception("Failed to get valid access token")
+    def get_symbols_from_file(self, symbols_filepath: str) -> List[str]:
+        """Get symbols from file separated by commas or newlines"""
+        with open(symbols_filepath, 'r') as file:
+            content = file.read().strip()
             
-            headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Accept': 'application/json'
-            }
-            
-            url = "https://api.schwabapi.com/trader/v1/userPreference"
-            
-            with httpx.Client() as client:
-                response = client.get(url, headers=headers)
+            # Check if file uses comma separation or newline separation
+            if ',' in content:
+                symbols = content.split(',')
+            else:
+                symbols = content.split('\n')
                 
-            if response.status_code != 200:
-                raise Exception(f"User preferences request failed: {response.status_code} - {response.text}")
-            
-            return response.json()
-            
-        except Exception as e:
-            if self.debug:
-                print(f"❌ Error getting user preferences: {e}")
-            raise
+            return [symbol.strip().upper() for symbol in symbols if symbol.strip()]
 
-    def parse_chart_data(self, content_item: dict) -> dict:
-        """Parse CHART_EQUITY message content using field mappings"""
+    def subscribe_chart_data(self, symbols: List[str]):
+        """Subscribe to CHART_EQUITY data for the given symbols"""
+        if not self.connected:
+            print("❌ Not connected to WebSocket")
+            return
+
         try:
-            # Extract the fields array from the content
-            fields = content_item.get('fields', [])
-            if not fields or len(fields) < 9:  # We expect at least 9 fields
-                return None
-
-            # Map the fields according to the Schwab API specification
-            parsed = {
-                'symbol': fields[0],          # key - Ticker symbol
-                'sequence': fields[1],        # sequence - Identifies the candle minute
-                'open': float(fields[2]),     # Open Price
-                'high': float(fields[3]),     # High Price
-                'low': float(fields[4]),      # Low Price
-                'close': float(fields[5]),    # Close Price
-                'volume': float(fields[6]),   # Volume
-                'time': int(fields[7]),       # Chart Time (milliseconds since Epoch)
-                'chart_day': int(fields[8])   # Chart Day
-            }
-
-            return parsed
-
-        except Exception as e:
-            print(f"❌ Error parsing CHART_EQUITY data: {e}")
-            return None
-
-    def on_message(self, ws, message):
-        """Handle WebSocket messages"""
-        try:
-            current_time = pd.Timestamp.now(tz='US/Eastern')
-            market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = current_time.replace(hour=16, minute=1, second=0, microsecond=0)
-            
-            # Check for 4pm daily email (send once per day)
-            four_pm = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
-            if current_time >= four_pm and not self.daily_email_sent:
-                self.send_daily_trades_email()
-                self.daily_email_sent = True
-            
-            # Reset daily flag at midnight
-            if current_time.hour == 0 and current_time.minute == 0 and self.daily_email_sent:
-                self.daily_email_sent = False
-            
-            # Ignore streaming data before 9:30 AM or after market close
-            if current_time < market_open:
-                if self.debug:
-                    print(f"🕐 Before market open ({current_time.strftime('%H:%M:%S ET')} < 09:30:00 ET), ignoring streaming data")
-                return
-            elif current_time >= market_close:
-                if self.debug:
-                    print(f"🕐 After market close ({current_time.strftime('%H:%M:%S ET')} >= 16:01:00 ET), ignoring streaming data")
-                return
-            
-            data = json.loads(message)
-            
-            if self.debug:
-                print(f"📨 Received message: {json.dumps(data, indent=2)}")
-            
-            # Handle different message types
-            if isinstance(data, dict):
-                if "response" in data:
-                    # Login response
-                    response_data = data["response"][0]
-                    if response_data.get("command") == "LOGIN":
-                        content = response_data.get("content", {})
-                        code = content.get("code", -1)
-                        if code == 0:
-                            print("✅ WebSocket login successful")
-                            msg = content.get("msg", "")
-                            if "status=" in msg:
-                                status = msg.split("status=")[1].split(";")[0] if ";" in msg else msg.split("status=")[1]
-                                print(f"📊 Account status: {status}")
-                            self.connected = True
-                            # Subscribe to symbols after successful login
-                            print("📊 Subscribing to symbols...")
-                            self.subscribe_chart_data(self.tracked_symbols)
-                            self.subscribe_option_data()  # Subscribe to option data
-                        else:
-                            print(f"❌ WebSocket login failed with code: {code}")
-                            print(f"   Message: {content.get('msg', 'Unknown error')}")
-                            self.connected = False
-                
-                elif "notify" in data:
-                    # Heartbeat or other notifications
-                    notify_data = data["notify"][0]
-                    if notify_data.get("heartbeat"):
-                        if self.debug:
-                            print("💓 Heartbeat received")
-                    elif notify_data.get("service") == "ADMIN":
-                        content = notify_data.get("content", {})
-                        if content.get("code") == 30:  # Empty subscription
-                            print("⚠️ Empty subscription detected, resubscribing...")
-                            self.subscribe_chart_data(self.tracked_symbols)
-                
-                elif "data" in data:
-                    # Market data
-                    for data_item in data["data"]:
-                        service = data_item.get("service")
-                        content = data_item.get("content", [])
-                        
-                        if service == "CHART_EQUITY" and content:
-                            for candle_data in content:
-                                # Parse the numeric key format
-                                # 1: chart time
-                                # 2: open price
-                                # 3: high price
-                                # 4: low price
-                                # 5: close price
-                                # 6: volume
-                                # 7: timestamp
-                                # 8: sequence number
-                                formatted_candle = {
-                                    'timestamp': int(candle_data.get('7', 0)),  # Chart Time (milliseconds since Epoch)
-                                    'open': float(candle_data.get('2', 0)),     # Open Price
-                                    'high': float(candle_data.get('3', 0)),     # High Price
-                                    'low': float(candle_data.get('4', 0)),      # Low Price
-                                    'close': float(candle_data.get('5', 0)),    # Close Price
-                                    'volume': float(candle_data.get('6', 0))    # Volume
-                                }
-                                
-                                symbol = candle_data.get('key')  # Symbol (ticker symbol in upper case)
-                                if symbol in self.tracked_symbols:
-                                    # Process new candle with the new workflow
-                                    self.process_new_candle(symbol, formatted_candle)
-                                    if self.debug:
-                                        print(f"Processed new candle for {symbol}: {formatted_candle}")
-                        
-                        elif service == "LEVELONE_OPTIONS" and content:
-                            for content_item in content:
-                                option_symbol = content_item.get('key')
-                                print(f"[DEBUG] Incoming option data for symbol: {option_symbol}")
-                                print(f"[DEBUG] Option data keys: {list(content_item.keys())}")
-                                if option_symbol:
-                                    self.options_manager.save_option_data_to_csv(option_symbol, content_item)
-                                    print(f"💾 Saved data for {option_symbol}")
-        except Exception as e:
-            print(f"❌ Message handling error: {str(e)}")
-            print(f"   Raw message: {message}")
-            raise
-
-    def on_error(self, ws, error):
-        """Handle WebSocket errors"""
-        print(f"❌ WebSocket error: {str(error)}")
-        self.connected = False
-
-    def on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket connection close"""
-        print(f"WebSocket connection closed: {close_status_code} - {close_msg}")
-        self.connected = False
-
-    def on_open(self, ws):
-        """Handle WebSocket connection open"""
-        print("🔗 WebSocket connected, attempting login...")
-        self.running = True
-        self.login()  # Send login request immediately after connection
-
-    def login(self):
-        """Send login request to WebSocket"""
-        try:
-            # Get fresh token
-            access_token = self.auth.get_access_token()
-            if not access_token:
-                raise Exception("Failed to get valid access token")
-
-            # Prepare login request
+            # Prepare the subscription request
             request = {
-                "service": "ADMIN",
-                "command": "LOGIN",
-                "requestid": str(self.request_id),
+                "service": "CHART_EQUITY",
+                "command": "SUBS",
+                "requestid": self.request_id,
                 "SchwabClientCustomerId": self.schwab_client_customer_id,
-                "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
+                "SchwabClientCorrelId": f"chart_{int(time.time() * 1000)}",
                 "parameters": {
-                    "Authorization": access_token,
-                    "SchwabClientChannel": self.streamer_info.get("schwabClientChannel", ""),
-                    "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId", "")
+                    "keys": ",".join(symbols),
+                    "fields": "0,1,2,3,4,5,6,7,8"  # All fields: key,sequence,open,high,low,close,volume,time,chart_day
                 }
             }
 
             if self.debug:
-                print(f"📤 Sending login: {json.dumps(request, indent=2)}")
+                print(f"📤 Sending CHART_EQUITY subscription request: {json.dumps(request, indent=2)}")
 
-            # Send login request
+            # Send the subscription request
             self.ws.send(json.dumps(request))
             self.request_id += 1
 
+            # Store the subscription
+            self.subscriptions["CHART_EQUITY"] = symbols
+
+            print(f"✅ Subscribed to CHART_EQUITY data for: {', '.join(symbols)}")
+
         except Exception as e:
-            print(f"❌ Login error: {str(e)}")
+            print(f"❌ Error subscribing to CHART_EQUITY data: {e}")
             raise
 
     def connect(self):
@@ -359,74 +178,6 @@ class SchwabStreamerClient:
                 self.ws.close()
             raise
 
-    def subscribe_chart_data(self, symbols: List[str]):
-        """Subscribe to CHART_EQUITY data for the given symbols"""
-        if not self.connected:
-            print("❌ Not connected to WebSocket")
-            return
-
-        try:
-            # Prepare the subscription request
-            request = {
-                "service": "CHART_EQUITY",
-                "command": "SUBS",
-                "requestid": self.request_id,
-                "SchwabClientCustomerId": self.schwab_client_customer_id,
-                "SchwabClientCorrelId": f"chart_{int(time.time() * 1000)}",
-                "parameters": {
-                    "keys": ",".join(symbols),
-                    "fields": "0,1,2,3,4,5,6,7,8"  # All fields: key,sequence,open,high,low,close,volume,time,chart_day
-                }
-            }
-
-            if self.debug:
-                print(f"📤 Sending CHART_EQUITY subscription request: {json.dumps(request, indent=2)}")
-
-            # Send the subscription request
-            self.ws.send(json.dumps(request))
-            self.request_id += 1
-
-            # Store the subscription
-            self.subscriptions["CHART_EQUITY"] = symbols
-
-            print(f"✅ Subscribed to CHART_EQUITY data for: {', '.join(symbols)}")
-
-        except Exception as e:
-            print(f"❌ Error subscribing to CHART_EQUITY data: {e}")
-            raise
-
-    def subscribe_option_data(self):
-        """Subscribe to LEVELONE_OPTIONS data for the option symbols to track"""
-        if not self.connected:
-            print("❌ Not connected to WebSocket")
-            return
-        if not self.option_symbols_to_track:
-            print("⚠️  No option symbols to track.")
-            return
-        print(f"[DEBUG] Subscribing to {len(self.option_symbols_to_track)} option symbols:")
-        for sym in self.option_symbols_to_track:
-            print(f"  {sym}")
-        try:
-            request = {
-                "service": "LEVELONE_OPTIONS",
-                "command": "SUBS",
-                "requestid": self.request_id,
-                "SchwabClientCustomerId": self.schwab_client_customer_id,
-                "SchwabClientCorrelId": f"options_{int(time.time() * 1000)}",
-                "parameters": {
-                    "keys": ",".join(self.option_symbols_to_track),
-                    "fields": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55"
-                }
-            }
-            if self.debug:
-                print(f"📤 Sending LEVELONE_OPTIONS subscription request: {json.dumps(request, indent=2)}")
-            self.ws.send(json.dumps(request))
-            self.request_id += 1
-            print(f"✅ Subscribed to LEVELONE_OPTIONS data for {len(self.option_symbols_to_track)} options.")
-        except Exception as e:
-            print(f"❌ Error subscribing to LEVELONE_OPTIONS data: {e}")
-            raise
-
     def disconnect(self):
         """Disconnect from WebSocket API"""
         self.running = False
@@ -434,6 +185,228 @@ class SchwabStreamerClient:
             self.ws.close()
 
         print("🔌 Disconnected from Schwab Streaming API")
+    
+    def get_user_preferences(self):
+        """Get user preferences using the SchwabAuth token"""
+        try:
+            # Get fresh token
+            access_token = self.auth.get_access_token()
+            if not access_token:
+                raise Exception("Failed to get valid access token")
+            
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/json'
+            }
+            
+            url = "https://api.schwabapi.com/trader/v1/userPreference"
+            
+            with httpx.Client() as client:
+                response = client.get(url, headers=headers)
+                
+            if response.status_code != 200:
+                raise Exception(f"User preferences request failed: {response.status_code} - {response.text}")
+            
+            return response.json()
+            
+        except Exception as e:
+            if self.debug:
+                print(f"❌ Error getting user preferences: {e}")
+            raise
+
+    def parse_chart_data(self, content_item: dict) -> dict:
+        """Parse CHART_EQUITY message content using field mappings"""
+        try:
+            # Extract the fields array from the content
+            fields = content_item.get('fields', [])
+            if not fields or len(fields) < 9:  # We expect at least 9 fields
+                return None
+
+            # Map the fields according to the Schwab API specification
+            parsed = {
+                'symbol': fields[0],          # key - Ticker symbol
+                'sequence': fields[1],        # sequence - Identifies the candle minute
+                'open': float(fields[2]),     # Open Price
+                'high': float(fields[3]),     # High Price
+                'low': float(fields[4]),      # Low Price
+                'close': float(fields[5]),    # Close Price
+                'volume': float(fields[6]),   # Volume
+                'time': int(fields[7]),       # Chart Time (milliseconds since Epoch)
+                'chart_day': int(fields[8])   # Chart Day
+            }
+
+            return parsed
+
+        except Exception as e:
+            print(f"❌ Error parsing CHART_EQUITY data: {e}")
+            return None
+
+    def on_message(self, _, message):
+        """Handle WebSocket messages"""
+        try:
+
+            # Current time in Eastern Time
+            current_time = pd.Timestamp.now(tz='US/Eastern')
+            # Market open and close times in Eastern Time
+            market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = current_time.replace(hour=16, minute=1, second=0, microsecond=0)
+            
+            # Check for 4pm daily email (send once per day)
+            four_pm = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+
+            # Send daily email if it's 4pm and we haven't sent it yet
+            if current_time >= four_pm and not self.daily_email_sent:
+                self.send_daily_trades_email()
+                self.daily_email_sent = True
+            
+            # Reset daily flag at midnight
+            if current_time.hour == 0 and current_time.minute == 0 and self.daily_email_sent:
+                self.daily_email_sent = False
+            
+            # Ignore streaming data before 9:30 AM or after market close
+            if current_time < market_open:
+                if self.debug:
+                    print(f"🕐 Before market open ({current_time.strftime('%H:%M:%S ET')} < 09:30:00 ET), ignoring streaming data")
+                return
+            elif current_time >= market_close:
+                if self.debug:
+                    print(f"🕐 After market close ({current_time.strftime('%H:%M:%S ET')} >= 16:01:00 ET), ignoring streaming data")
+                return
+            
+            data = json.loads(message)
+            
+            if self.debug:
+                print(f"📨 Received message: {json.dumps(data, indent=2)}")
+            
+            # Handle different message types
+            if isinstance(data, dict):
+                if "response" in data:
+                    # Login response
+                    response_data = data["response"][0]
+                    if response_data.get("command") == "LOGIN":
+                        content = response_data.get("content", {})
+                        code = content.get("code", -1)
+                        if code == 0:
+                            print("✅ WebSocket login successful")
+                            msg = content.get("msg", "")
+                            if "status=" in msg:
+                                status = msg.split("status=")[1].split(";")[0] if ";" in msg else msg.split("status=")[1]
+                                print(f"📊 Account status: {status}")
+                            self.connected = True
+                            print("📊 Subscribing to symbols...")
+                            self.subscribe_chart_data(self.equity_symbols)
+                        else:
+                            print(f"❌ WebSocket login failed with code: {code}")
+                            print(f"   Message: {content.get('msg', 'Unknown error')}")
+                            self.connected = False
+                
+                elif "notify" in data:
+                    # Heartbeat or other notifications
+                    notify_data = data["notify"][0]
+                    if notify_data.get("heartbeat"):
+                        if self.debug:
+                            print("💓 Heartbeat received")
+                    elif notify_data.get("service") == "ADMIN":
+                        content = notify_data.get("content", {})
+                        if content.get("code") == 30:  # Empty subscription
+                            print("⚠️ Empty subscription detected, resubscribing...")
+                            self.subscribe_chart_data(self.tracked_symbols)
+                
+                elif "data" in data:
+                    # Market data
+                    for data_item in data["data"]:
+                        service = data_item.get("service")
+                        content = data_item.get("content", [])
+                        
+                        if service == "CHART_EQUITY" and content:
+                            for candle_data in content:
+                                # Parse the numeric key format
+                                # 1: chart time
+                                # 2: open price
+                                # 3: high price
+                                # 4: low price
+                                # 5: close price
+                                # 6: volume
+                                # 7: timestamp
+                                # 8: sequence number
+                                formatted_candle = {
+                                    'timestamp': int(candle_data.get('7', 0)),  # Chart Time (milliseconds since Epoch)
+                                    'open': float(candle_data.get('2', 0)),     # Open Price
+                                    'high': float(candle_data.get('3', 0)),     # High Price
+                                    'low': float(candle_data.get('4', 0)),      # Low Price
+                                    'close': float(candle_data.get('5', 0)),    # Close Price
+                                    'volume': float(candle_data.get('6', 0))    # Volume
+                                }
+                                
+                                symbol = candle_data.get('key')  # Symbol (ticker symbol in upper case)
+                                if symbol in self.tracked_symbols:
+                                    # Process new candle with the new workflow
+                                    self.process_new_candle(symbol, formatted_candle)
+                                    if self.debug:
+                                        print(f"Processed new candle for {symbol}: {formatted_candle}")
+                else:
+                    # Handle unexpected message types
+                    if self.debug:
+                        print(f"⚠️ Unexpected message type received: {list(data.keys())}")
+                    else:
+                        print(f"⚠️ Unexpected message type received with keys: {list(data.keys())}")
+        except Exception as e:
+            print(f"❌ Message handling error: {str(e)}")
+            print(f"   Raw message: {message}")
+            raise
+
+    def on_error(self, _, error):
+        """Handle WebSocket errors"""
+        print(f"❌ WebSocket error: {str(error)}")
+        self.connected = False
+
+    def on_close(self, _, close_status_code, close_msg):
+        """Handle WebSocket connection close"""
+        print(f"WebSocket connection closed: {close_status_code} - {close_msg}")
+        self.connected = False
+
+    def on_open(self, _):
+        """Handle WebSocket connection open"""
+        print("🔗 WebSocket connected, attempting login...")
+        self.running = True
+        self.login()  # Send login request immediately after connection
+
+    def login(self):
+        """Send login request to WebSocket"""
+        try:
+            # Get fresh token
+            access_token = self.auth.get_access_token()
+            if not access_token:
+                raise Exception("Failed to get valid access token")
+
+            # Prepare login request
+            request = {
+                "service": "ADMIN",
+                "command": "LOGIN",
+                "requestid": str(self.request_id),
+                "SchwabClientCustomerId": self.schwab_client_customer_id,
+                "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
+                "parameters": {
+                    "Authorization": access_token,
+                    "SchwabClientChannel": self.streamer_info.get("schwabClientChannel", ""),
+                    "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId", "")
+                }
+            }
+
+            if self.debug:
+                print(f"📤 Sending login: {json.dumps(request, indent=2)}")
+
+            # Send login request
+            self.ws.send(json.dumps(request))
+            self.request_id += 1
+
+        except Exception as e:
+            print(f"❌ Login error: {str(e)}")
+            raise
+
+    
+
+   
 
     def process_new_candle(self, symbol: str, candle_data: dict):
         """
@@ -504,23 +477,50 @@ class SchwabStreamerClient:
                     print(f"   ROC: {bootstrap_params['roc_period'].get(timeframe, 6)}")
                     print(f"   MACD: {bootstrap_params['fast_ema'].get(timeframe, 15)}/{bootstrap_params['slow_ema'].get(timeframe, 39)}/{bootstrap_params['signal_ema'].get(timeframe, 11)}")
                 
-                # Load existing indicator states for continuity
-                indicator_states = self.data_manager.indicator_generator.load_indicator_states(symbol, timeframe)
-                
-                # Generate indicators incrementally for just the new row using bootstrap values
-                df_with_indicators = self.data_manager.indicator_generator.generate_indicators_incremental(
-                    df, symbol, timeframe,
-                    ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
-                    vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
-                    roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
-                    fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
-                    slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
-                    signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9),
-                    states=indicator_states
-                )
-                
-                # Save updated indicator states
-                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe, df_with_indicators)
+                # Check if we have enough historical data for incremental processing
+                roc_period = bootstrap_params['roc_period'].get(timeframe, 6)
+                if len(df) < roc_period + 1:  # Need at least roc_period + 1 rows for ROC calculation
+                    if self.debug:
+                        print(f"📊 Insufficient data for incremental processing ({len(df)} rows < {roc_period + 1}), using bulk calculation")
+                    # Use bulk calculation for the entire DataFrame
+                    df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                        symbol, timeframe, df, None,  # Pass entire DataFrame for bulk processing
+                        ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                        vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                        roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                        fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                        slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                        signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                    )
+                else:
+                    if self.debug:
+                        print(f"📊 Using incremental processing ({len(df)} rows >= {roc_period + 1})")
+                    # Use incremental processing with proper state management
+                    # Check if we have more than one row to split properly
+                    if len(df) == 1:
+                        if self.debug:
+                            print(f"📊 Only one row, using bulk calculation instead of incremental")
+                        # Use bulk calculation for single row
+                        df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                            symbol, timeframe, df, None,  # Pass entire DataFrame for bulk processing
+                            ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                            vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                            roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                            fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                            slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                            signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                        )
+                    else:
+                        # Use incremental processing with proper state management
+                        df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                            symbol, timeframe, df.iloc[:-1], df.iloc[-1:],  # Pass existing data and new row separately
+                            ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                            vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                            roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                            fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                            slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                            signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                        )
             
             except Exception as e:
                 print(f"⚠️  Error generating indicators for {symbol} {timeframe}: {e}")
@@ -536,16 +536,10 @@ class SchwabStreamerClient:
             # Process signals for the new row only (real-time processing)
             if len(df_with_indicators) > 0:
                 latest_row = df_with_indicators.iloc[-1]
-                # Always process the latest row for signals, even if indicators are NaN
-                self.data_manager.signal_processor.process_latest_signal(
-                    symbol, timeframe, latest_row, is_historical=False
-                )
+                # Use data manager's process_latest_signal which handles both original and inverse symbols
+                self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
                 if self.debug:
                     print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
-            
-            # Also process inverse symbol if it's a base symbol
-            if not symbol.endswith('_inverse'):
-                self.process_inverse_candle(symbol, candle_data, timeframe)
             
             # Process aggregated timeframes (5m, 10m, 15m, 30m) if it's time
             if not symbol.endswith('_inverse'):  # Only aggregate base symbols
@@ -554,47 +548,9 @@ class SchwabStreamerClient:
             # Print confirmation (only in debug mode to avoid spam)
             if self.debug:
                 print(f"✅ Processed new candle: {symbol} {timeframe} @ {timestamp_dt.strftime('%H:%M:%S')} Close=${candle_data['close']:.2f}")
-        
+
         except Exception as e:
             print(f"❌ Error processing new candle for {symbol}: {e}")
-            if self.debug:
-                import traceback
-                traceback.print_exc()
-
-    def process_inverse_candle(self, base_symbol: str, candle_data: dict, timeframe: str):
-        """
-        Process inverse candle data (1/price) for the base symbol
-        - Generate inverse OHLCV data
-        - Add to CSV and DataFrame
-        - Generate indicators with bootstrap parameters
-        - Process signals
-        """
-        try:
-            inverse_symbol = f"{base_symbol}_inverse"
-            
-            # Generate inverse candle data (1/price for OHLC, same volume)
-            inverse_candle = {
-                'timestamp': candle_data['timestamp'],
-                'open': 1.0 / candle_data['open'] if candle_data['open'] != 0 else 0,
-                'high': 1.0 / candle_data['low'] if candle_data['low'] != 0 else 0,  # Inverse: high becomes 1/low
-                'low': 1.0 / candle_data['high'] if candle_data['high'] != 0 else 0,  # Inverse: low becomes 1/high
-                'close': 1.0 / candle_data['close'] if candle_data['close'] != 0 else 0,
-                'volume': candle_data['volume']  # Volume stays the same
-            }
-            
-            if self.debug:
-                print(f"🔄 Processing inverse candle for {inverse_symbol}")
-                print(f"   Original: O={candle_data['open']:.4f} H={candle_data['high']:.4f} L={candle_data['low']:.4f} C={candle_data['close']:.4f}")
-                print(f"   Inverse:  O={inverse_candle['open']:.4f} H={inverse_candle['high']:.4f} L={inverse_candle['low']:.4f} C={inverse_candle['close']:.4f}")
-            
-            # Add inverse candle to buffer for aggregation
-            self.add_to_candle_buffer(inverse_symbol, inverse_candle)
-            
-            # Process the inverse candle with full processing (this will handle CSV, indicators, and signals)
-            self.process_new_candle(inverse_symbol, inverse_candle)
-            
-        except Exception as e:
-            print(f"❌ Error processing inverse candle for {base_symbol}: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()
@@ -713,18 +669,11 @@ class SchwabStreamerClient:
                     # Process the aggregated candle (this handles CSV, indicators, signals)
                     self.process_new_candle_for_timeframe(symbol, aggregated_candle, timeframe)
                     
-                    # Also process inverse symbol for this timeframe
-                    inverse_symbol = f"{symbol}_inverse"
-                    if inverse_symbol in self.candle_buffers:
-                        inverse_aggregated = self.aggregate_candles(inverse_symbol, timeframe, current_timestamp)
-                        if inverse_aggregated:
-                            self.process_new_candle_for_timeframe(inverse_symbol, inverse_aggregated, timeframe)
-                    
                     # Update last aggregation time
                     self.last_aggregation_times[symbol][timeframe] = current_timestamp
                     
                     if self.debug:
-                        print(f"✅ Processed aggregated {timeframe} candle for {symbol} and {inverse_symbol}")
+                        print(f"✅ Processed aggregated {timeframe} candle for {symbol}")
 
     def process_new_candle_for_timeframe(self, symbol: str, candle_data: dict, timeframe: str):
         """
@@ -783,32 +732,59 @@ class SchwabStreamerClient:
             try:
                 # Get bootstrap parameters for the timeframe
                 bootstrap_params = self.data_manager.get_bootstrap_parameters()
-                
-                if self.debug:
+
+            if self.debug:
                     print(f"📊 Using bootstrap parameters for {symbol} {timeframe}:")
                     print(f"   EMA: {bootstrap_params['ema_period'].get(timeframe, 7)}")
                     print(f"   VWMA: {bootstrap_params['vwma_period'].get(timeframe, 17)}")
                     print(f"   ROC: {bootstrap_params['roc_period'].get(timeframe, 8)}")
                     print(f"   MACD: {bootstrap_params['fast_ema'].get(timeframe, 12)}/{bootstrap_params['slow_ema'].get(timeframe, 26)}/{bootstrap_params['signal_ema'].get(timeframe, 9)}")
                 
-                # Load existing indicator states for continuity
-                indicator_states = self.data_manager.indicator_generator.load_indicator_states(symbol, timeframe)
-                
-                # Generate indicators incrementally for just the new row using bootstrap values
-                df_with_indicators = self.data_manager.indicator_generator.generate_indicators_incremental(
-                    df, symbol, timeframe,
-                    ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
-                    vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
-                    roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
-                    fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
-                    slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
-                    signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9),
-                    states=indicator_states
-                )
-                
-                # Save updated indicator states
-                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe, df_with_indicators)
-                
+                # Check if we have enough historical data for incremental processing
+                roc_period = bootstrap_params['roc_period'].get(timeframe, 6)
+                if len(df) < roc_period + 1:  # Need at least roc_period + 1 rows for ROC calculation
+                    if self.debug:
+                        print(f"📊 Insufficient data for incremental processing ({len(df)} rows < {roc_period + 1}), using bulk calculation")
+                    # Use bulk calculation for the entire DataFrame
+                    df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                        symbol, timeframe, df, None,  # Pass entire DataFrame for bulk processing
+                        ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                        vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                        roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                        fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                        slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                        signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                    )
+                else:
+                    if self.debug:
+                        print(f"📊 Using incremental processing ({len(df)} rows >= {roc_period + 1})")
+                    # Use incremental processing with proper state management
+                    # Check if we have more than one row to split properly
+                    if len(df) == 1:
+                        if self.debug:
+                            print(f"📊 Only one row, using bulk calculation instead of incremental")
+                        # Use bulk calculation for single row
+                        df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                            symbol, timeframe, df, None,  # Pass entire DataFrame for bulk processing
+                            ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                            vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                            roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                            fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                            slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                            signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                        )
+                    else:
+                        # Use incremental processing with proper state management
+                        df_with_indicators = self.data_manager.indicator_generator.smart_indicator_calculation(
+                            symbol, timeframe, df.iloc[:-1], df.iloc[-1:],  # Pass existing data and new row separately
+                            ema_period=bootstrap_params['ema_period'].get(timeframe, 7),
+                            vwma_period=bootstrap_params['vwma_period'].get(timeframe, 17),
+                            roc_period=bootstrap_params['roc_period'].get(timeframe, 8),
+                            fast_ema=bootstrap_params['fast_ema'].get(timeframe, 12),
+                            slow_ema=bootstrap_params['slow_ema'].get(timeframe, 26),
+                            signal_ema=bootstrap_params['signal_ema'].get(timeframe, 9)
+                        )
+            
             except Exception as e:
                 print(f"⚠️  Error generating indicators for {symbol} {timeframe}: {e}")
                 df_with_indicators = df
@@ -823,17 +799,14 @@ class SchwabStreamerClient:
             # Process signals for the new row only (real-time processing)
             if len(df_with_indicators) > 0:
                 latest_row = df_with_indicators.iloc[-1]
-                # Always process the latest row for signals, even if indicators are NaN
-                self.data_manager.signal_processor.process_latest_signal(
-                    symbol, timeframe, latest_row, is_historical=False
-                )
-                
+                # Use data manager's process_latest_signal which handles both original and inverse symbols
+                self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
                 if self.debug:
                     print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
             # Print confirmation (only in debug mode to avoid spam)
             if self.debug:
                 print(f"✅ Processed new {timeframe} candle: {symbol} @ {timestamp_dt.strftime('%H:%M:%S')} Close=${candle_data['close']:.2f}")
-        
+
         except Exception as e:
             print(f"❌ Error processing new {timeframe} candle for {symbol}: {e}")
             if self.debug:
@@ -843,7 +816,7 @@ class SchwabStreamerClient:
 
 if __name__ == "__main__":
     # Create client (debug mode will be enabled after bootstrap)
-    client = SchwabStreamerClient(debug=False)
+    client = SchwabStreamerClient()
     try:
         # Run bootstrap first to ensure all historical data is processed
         print("🚀 Running bootstrap to process historical data...")

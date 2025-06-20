@@ -80,6 +80,13 @@ class IndicatorGenerator:
             # Calculate all ROCs
             if roc_period:
                 new_cols[f'roc_{roc_period}'] = df['close'].pct_change(periods=roc_period)
+                # Debug ROC calculation in bulk processing
+                debug_bulk_roc = True
+                if debug_bulk_roc:
+                    print(f"   [Bulk ROC Debug] Calculating ROC for {len(df)} rows with period {roc_period}")
+                    print(f"   [Bulk ROC Debug] First few ROC values: {new_cols[f'roc_{roc_period}'].head(10).tolist()}")
+                    print(f"   [Bulk ROC Debug] Last few ROC values: {new_cols[f'roc_{roc_period}'].tail(10).tolist()}")
+                    print(f"   [Bulk ROC Debug] NaN count: {new_cols[f'roc_{roc_period}'].isna().sum()}")
             
             # Calculate all MACDs
             if fast_ema and slow_ema and signal_ema:
@@ -185,19 +192,34 @@ class IndicatorGenerator:
                 roc_values = []
                 roc_buffer = last_vals['roc_buffer']
                 
-                for close_price in result_df['close']:
+                # Debug ROC calculation
+                debug_roc = True  # Set to True for debugging
+                if debug_roc:
+                    print(f"   [ROC Debug] Starting ROC calculation with buffer size: {len(roc_buffer)}")
+                    print(f"   [ROC Debug] ROC period: {roc_period}")
+                    print(f"   [ROC Debug] New data points: {len(result_df)}")
+                
+                for i, close_price in enumerate(result_df['close']):
                     if len(roc_buffer) > roc_period:
                         roc_buffer.pop(0)
                     roc_buffer.append(close_price)
                     if len(roc_buffer) == roc_period:
                         roc = (close_price - roc_buffer[0]) / roc_buffer[0]
+                        if debug_roc:
+                            print(f"   [ROC Debug] Point {i}: Calculated ROC: ({close_price} - {roc_buffer[0]}) / {roc_buffer[0]} = {roc}")
                     else:
                         roc = np.nan
+                        if debug_roc:
+                            print(f"   [ROC Debug] Point {i}: Not enough data for ROC: buffer size {len(roc_buffer)} < {roc_period}")
                     
                     roc_values.append(roc)
                 
                 result_df[f'roc_{roc_period}'] = roc_values
                 last_vals['roc_buffer'] = roc_buffer
+                
+                if debug_roc:
+                    print(f"   [ROC Debug] Final ROC buffer size: {len(roc_buffer)}")
+                    print(f"   [ROC Debug] ROC values: {roc_values}")
             
             # Calculate MACD for new data points
             if fast_ema and slow_ema and signal_ema:
@@ -400,36 +422,27 @@ class IndicatorGenerator:
         print(f"💾 Stored last values for {symbol} {timeframe} calculations")
 
     def smart_indicator_calculation(self, symbol: str, timeframe: str, original_df: pd.DataFrame, 
-                                   additional_df: pd.DataFrame = None, ema_period: int = None, 
-                                   vwma_period: int = None, roc_period: int = None,
+                                   additional_df: pd.DataFrame = None,
+                                   ema_period: int = None, vwma_period: int = None, roc_period: int = None,
                                    fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> pd.DataFrame:
         """
-        Smart indicator calculation with state persistence support.
-        
-        Two main use cases:
-        1. Initial bulk calculation: Pass only original_df
-        2. Incremental calculation: Pass both original_df (with existing indicators) and additional_df (new data)
-        
-        Args:
-            symbol (str): Symbol name
-            timeframe (str): Timeframe (e.g., '5m', '10m')
-            original_df (pd.DataFrame): Original data with existing indicators (for incremental processing)
-            additional_df (pd.DataFrame): New data to process and add indicators to
-            ema_period (int): EMA period
-            vwma_period (int): VWMA period
-            roc_period (int): ROC period
-            fast_ema (int): Fast EMA for MACD
-            slow_ema (int): Slow EMA for MACD
-            signal_ema (int): Signal EMA for MACD
-            
-        Returns:
-            pd.DataFrame: DataFrame with calculated indicators
+        Smart indicator calculation that handles both bulk and incremental processing
         """
+        # Safety check: ensure original_df is not None and has data
+        if original_df is None or (hasattr(original_df, 'empty') and original_df.empty) or len(original_df) == 0:
+            print(f"❌ Error: original_df is None or empty for {symbol} {timeframe}")
+            return pd.DataFrame()  # Return empty DataFrame instead of None
+            
+        # Safety check: if additional_df is provided but empty, treat as None
+        if additional_df is not None and ((hasattr(additional_df, 'empty') and additional_df.empty) or len(additional_df) == 0):
+            print(f"📊 Additional DataFrame is empty for {symbol} {timeframe}, treating as None")
+            additional_df = None
+
         try:
             key = f"{symbol}_{timeframe}"
             
             # CASE 1: No additional_df passed - Initial bulk calculation
-            if not additional_df:
+            if not additional_df or (hasattr(additional_df, 'empty') and additional_df.empty):
                 print(f"📊 Initial bulk calculation for {symbol} {timeframe}")
                 print(f"📊 Processing {len(original_df)} original data points")
                 
@@ -452,7 +465,26 @@ class IndicatorGenerator:
             
             # CASE 2: Additional_df passed - Incremental calculation
             print(f"⚡ Incremental calculation for {symbol} {timeframe}")
-            print(f"📊 Processing {len(additional_df)} additional data points")
+            print(f"📊 Processing {len(original_df)} original + {len(additional_df)} additional data points")
+            
+            # Check if original_df is empty - if so, use bulk calculation on additional_df
+            if len(original_df) == 0 or (hasattr(original_df, 'empty') and original_df.empty):
+                print(f"📊 Original DataFrame is empty, using bulk calculation on additional data")
+                result = self.generate_all_indicators(symbol, timeframe, additional_df, 
+                                              ema_period, vwma_period, roc_period, 
+                                              fast_ema, slow_ema, signal_ema)
+                
+                # Store final state from bulk calculation
+                self._store_last_values_from_dataframe(symbol, timeframe, result, 
+                                                          ema_period, vwma_period, roc_period,
+                                                          fast_ema, slow_ema, signal_ema)
+                
+                return result
+            
+            # Check if additional_df is empty - if so, return original_df
+            if len(additional_df) == 0 or (hasattr(additional_df, 'empty') and additional_df.empty):
+                print(f"📊 Additional DataFrame is empty, returning original data")
+                return original_df
             
             # Initialize state if not exists
             if key not in self.last_values:

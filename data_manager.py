@@ -101,19 +101,21 @@ import multiprocessing as mp
 
 
 class DataManager:
-    def __init__(self):
+    def __init__(self, schwab_auth: SchwabAuth, symbols: List[str], timeframes: List[str]):
         """
         Initialize the DataManager class
         """
-        self.schwab_auth = SchwabAuth()
+        self.schwab_auth = schwab_auth
         self.indicator_generator = IndicatorGenerator()
         self.signal_processor = SignalProcessor()
+
         # Store the most recent DataFrame for each (symbol, timeframe) pair
         self.latestDF: Dict[str, pd.DataFrame] = {}
+        
         # Import symbols from symbols.txt
-        self.symbols = self.get_symbols_from_file("symbols.txt")
+        self.symbols = symbols
         # Valid timeframes for API calls
-        self.timeframes = ["1m", "5m", "10m", "15m", "30m"]
+        self.timeframes = timeframes
         # Create data directory and timeframe subdirectories if they don't exist
         os.makedirs('data', exist_ok=True)
         for timeframe in self.timeframes:
@@ -126,19 +128,7 @@ class DataManager:
         self.market_open = datetime.strptime('09:30', '%H:%M').time()
         self.market_close = datetime.strptime('16:00', '%H:%M').time()
 
-    def get_symbols_from_file(self, symbols_filepath: str) -> List[str]:
-        """Get symbols from file separated by commas or newlines"""
-        with open(symbols_filepath, 'r') as file:
-            content = file.read().strip()
-            
-            # Check if file uses comma separation or newline separation
-            if ',' in content:
-                symbols = content.split(',')
-            else:
-                symbols = content.split('\n')
-                
-            return [symbol.strip().upper() for symbol in symbols if symbol.strip()]
-
+    
     def _extract_frequency_number(self, interval) -> int:
         """Extract numeric frequency from interval string (e.g., '5m' -> 5) or return int if already int"""
         try:
@@ -216,16 +206,16 @@ class DataManager:
     def _load_df_from_csv(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """Load DataFrame from CSV file"""
         csv_filename = self._get_csv_filename(symbol, timeframe)
-        try:
-            df = pd.read_csv(csv_filename)
+            try:
+                df = pd.read_csv(csv_filename)
             # Keep timestamp as numeric (milliseconds) for consistency with API data
             # Don't convert to datetime here to avoid division errors later
-            return df
+                return df
         except FileNotFoundError:
             return None
-        except Exception as e:
+            except Exception as e:
             print(f"❌ Error loading CSV file {csv_filename}: {e}")
-            return None
+        return None
 
     def _save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
         """Save DataFrame to CSV file"""
@@ -270,7 +260,7 @@ class DataManager:
                 print(f"❌ Fallback save also failed: {fallback_error}")
 
     def _fetch_data_from_schwab(self, symbol: str, start_date: datetime, end_date: datetime, 
-                               interval_to_fetch: int, timeframe: str = None) -> Optional[pd.DataFrame]:
+                               interval_to_fetch: int) -> Optional[pd.DataFrame]:
         """
         Fetch data from Schwab API for a given date range
         
@@ -279,7 +269,6 @@ class DataManager:
             start_date: Start datetime
             end_date: End datetime
             interval_to_fetch: Interval in minutes
-            timeframe: Timeframe string for period calculation
             
         Returns:
             DataFrame with fetched data or None if failed
@@ -290,20 +279,15 @@ class DataManager:
 
         symbol = symbol.upper()
 
-        # Validate credentials first
-        if not self.schwab_auth.validate_credentials():
-            print("❌ Schwab credentials validation failed")
+        # Get access token (this handles all credential validation and token refresh internally)
+        access_token = self.schwab_auth.get_access_token()
+        if not access_token:
+            print("❌ Failed to get valid access token")
             return None
 
-        # Check if we're authenticated
-        if not self.schwab_auth.is_authenticated():
-            print("❌ Not authenticated with Schwab API")
-            return None
-
-        headers = self.schwab_auth.get_auth_headers()
-        if not headers:
-            print("❌ No valid authentication headers available")
-            return None
+        headers = {
+            'Authorization': f'Bearer {access_token}'
+        }
 
         url = "https://api.schwabapi.com/marketdata/v1/pricehistory"
 
@@ -448,7 +432,7 @@ class DataManager:
             
             if last_datetime_et < end_date:
                 print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes, timeframe)
+                new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
                 
                 if new_df is not None and len(new_df) > 0:
                     # Filter out data that might overlap with existing data
@@ -463,6 +447,11 @@ class DataManager:
                             ema_period, vwma_period, roc_period,
                             fast_ema, slow_ema, signal_ema
                         )
+                        
+                        # Check if result is valid
+                        if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
+                            print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
+                            return original_df
                         
                         # Save updated result and update memory
                         self._save_df_to_csv(result_df, symbol, timeframe)
@@ -495,7 +484,7 @@ class DataManager:
                 
                 if last_datetime_et < end_date:
                     print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes, timeframe)
+                    new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
                     
                     if new_df is not None and len(new_df) > 0:
                         # Filter out data that might overlap with existing data
@@ -510,6 +499,11 @@ class DataManager:
                                 ema_period, vwma_period, roc_period,
                                 fast_ema, slow_ema, signal_ema
                             )
+                            
+                            # Check if result is valid
+                            if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
+                                print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
+                                return original_df
                             
                             # Save updated result and update memory
                             self._save_df_to_csv(result_df, symbol, timeframe)
@@ -526,6 +520,11 @@ class DataManager:
                     fast_ema, slow_ema, signal_ema
                 )
                 
+                # Check if result is valid
+                if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
+                    print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
+                    return original_df
+                
                 # Save result and update memory
                 self._save_df_to_csv(result_df, symbol, timeframe)
                 self.latestDF[df_key] = result_df
@@ -535,18 +534,29 @@ class DataManager:
             else:
                 # Perform initial historical fetch
                 
-                # Perform initial fetch based on timeframe
+                # Try to load existing data from CSV to get the last timestamp
+                existing_df = self._load_df_from_csv(symbol, timeframe)
+                
+                if existing_df is not None and len(existing_df) > 0:
+                    # Use the last timestamp from existing data as start date
+                    last_timestamp = existing_df['timestamp'].max()
+                    last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
+                    start_date = last_datetime_utc.astimezone(self.et_tz)
+                    print(f"📊 Using last timestamp from existing data as start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                else:
+                    # No existing data, use default start dates based on timeframe
                 if timeframe == '1m':
                     # For 1m: fetch from today's market open to last completed timestamp
                     start_date = self._get_market_open_today()
                 else:
                     # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
                     start_date = self.et_tz.localize(datetime(2025, 1, 1))
+                    print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 
                 end_date = self._get_last_completed_timestamp()
                 
                 print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes, timeframe)
+                df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
                 
                 if df is not None and len(df) > 0:
                     # Save to memory and CSV
@@ -560,6 +570,11 @@ class DataManager:
                         ema_period, vwma_period, roc_period,
                         fast_ema, slow_ema, signal_ema
                     )
+                    
+                    # Check if result is valid
+                    if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
+                        print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
+                        return original_df
                     
                     # Save result and update memory
                     self._save_df_to_csv(result_df, symbol, timeframe)
@@ -618,6 +633,11 @@ class DataManager:
                     ema_period, vwma_period, roc_period,
                     fast_ema, slow_ema, signal_ema
                 )
+                
+                # Check if result is valid
+                if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
+                    print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
+                    return None
                 
                 # Save inverse data
                 self._save_df_to_csv(result_df, symbol, timeframe)
@@ -693,17 +713,17 @@ class DataManager:
         # Only process signals if they haven't been processed before
         if result_df is not None:
             if not original_signals_processed:
-                # Process trading signals for the original symbol
-                self.process_signals(symbol, timeframe, result_df)
-                print(f"✅ Processed signals for {symbol} {timeframe}")
+            # Process trading signals for the original symbol
+            self.process_signals(symbol, timeframe, result_df)
+            print(f"✅ Processed signals for {symbol} {timeframe}")
             else:
                 print(f"📊 Skipped signal processing for {symbol} {timeframe} (already processed)")
             
         if result_df_inverse is not None:
             if not inverse_signals_processed:
-                # Process trading signals for the inverse symbol
-                self.process_signals(inverse_symbol, timeframe, result_df_inverse)
-                print(f"✅ Processed signals for {inverse_symbol} {timeframe}")
+            # Process trading signals for the inverse symbol
+            self.process_signals(inverse_symbol, timeframe, result_df_inverse)
+            print(f"✅ Processed signals for {inverse_symbol} {timeframe}")
             else:
                 print(f"📊 Skipped signal processing for {inverse_symbol} {timeframe} (already processed)")
             
@@ -1224,7 +1244,7 @@ class DataManager:
                     
                     if result is not None and len(result) > 0:
                         print(f"✅ Successfully processed {symbol} {timeframe}")
-                    else:
+    else:
                         print(f"❌ Failed to process {symbol} {timeframe}")
         # Email general summary
         print("\n📧 Sending general summary email...")

@@ -87,12 +87,12 @@ FEATURES:
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 import pytz
 from typing import Optional, List, Dict, Tuple
 import os
-from email_manager.email_manager import EmailManager
+from email_manager import EmailManager
+import math
 
 
 class Trade:
@@ -377,7 +377,7 @@ class SignalProcessor:
         except Exception as e:
             print(f"❌ Error saving trades batch to CSV: {e}")
             
-    def _check_buy_signal(self, row: pd.Series) -> bool:
+    def _check_buy_signal(self, row: pd.Series, debug: bool = False) -> bool:
         """
         Check if buy signal conditions are met.
         
@@ -388,6 +388,7 @@ class SignalProcessor:
         
         Args:
             row: DataFrame row with indicator values
+            debug: Whether to show debug output (default: False)
             
         Returns:
             bool: True if buy signal conditions are met
@@ -400,8 +401,25 @@ class SignalProcessor:
             macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
             macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
             
+            # ENHANCED DEBUG: Check if all required indicators are present
+            if debug:
+                print(f"   [Buy Signal Debug] Checking indicator presence:")
+                print(f"     EMA columns found: {ema_col}")
+                print(f"     VWMA columns found: {vwma_col}")
+                print(f"     ROC columns found: {roc_col}")
+                print(f"     MACD Line columns found: {macd_line_col}")
+                print(f"     MACD Signal columns found: {macd_signal_col}")
+            
             # Check if all required indicators are present
             if not (ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col):
+                if debug:
+                    missing_indicators = []
+                    if not ema_col: missing_indicators.append("EMA")
+                    if not vwma_col: missing_indicators.append("VWMA")
+                    if not roc_col: missing_indicators.append("ROC")
+                    if not macd_line_col: missing_indicators.append("MACD Line")
+                    if not macd_signal_col: missing_indicators.append("MACD Signal")
+                    print(f"   [Buy Signal Debug] Missing indicators: {missing_indicators}")
                 return False
                 
             # Get values
@@ -411,8 +429,28 @@ class SignalProcessor:
             macd_line = row[macd_line_col[0]]
             macd_signal = row[macd_signal_col[0]]
             
-            # Check for NaN values
-            if pd.isna(ema) or pd.isna(vwma) or pd.isna(roc) or pd.isna(macd_line) or pd.isna(macd_signal):
+            # ENHANCED DEBUG: Check for NaN values
+            if debug:
+                print(f"   [Buy Signal Debug] Indicator values:")
+                print(f"     EMA: {ema} (NaN: {pd.isna(ema) or str(ema) == 'nan'})")
+                print(f"     VWMA: {vwma} (NaN: {pd.isna(vwma) or str(vwma) == 'nan'})")
+                print(f"     ROC: {roc} (NaN: {pd.isna(roc) or str(roc) == 'nan'})")
+                print(f"     MACD Line: {macd_line} (NaN: {pd.isna(macd_line) or str(macd_line) == 'nan'})")
+                print(f"     MACD Signal: {macd_signal} (NaN: {pd.isna(macd_signal) or str(macd_signal) == 'nan'})")
+            
+            # Check for NaN values using multiple methods
+            def is_nan_value(value):
+                return pd.isna(value) or str(value).lower() == 'nan' or (isinstance(value, float) and math.isnan(value))
+            
+            if is_nan_value(ema) or is_nan_value(vwma) or is_nan_value(roc) or is_nan_value(macd_line) or is_nan_value(macd_signal):
+                if debug:
+                    nan_indicators = []
+                    if is_nan_value(ema): nan_indicators.append("EMA")
+                    if is_nan_value(vwma): nan_indicators.append("VWMA")
+                    if is_nan_value(roc): nan_indicators.append("ROC")
+                    if is_nan_value(macd_line): nan_indicators.append("MACD Line")
+                    if is_nan_value(macd_signal): nan_indicators.append("MACD Signal")
+                    print(f"   [Buy Signal Debug] NaN indicators: {nan_indicators}")
                 return False
                 
             # Check buy signal conditions
@@ -420,13 +458,24 @@ class SignalProcessor:
             condition2 = roc > 0
             condition3 = macd_line > macd_signal
             
-            return condition1 and condition2 and condition3
+            # ENHANCED DEBUG: Show condition results
+            if debug:
+                print(f"   [Buy Signal Debug] Condition results:")
+                print(f"     Condition 1 (EMA > VWMA): {ema} > {vwma} = {condition1}")
+                print(f"     Condition 2 (ROC > 0): {roc} > 0 = {condition2}")
+                print(f"     Condition 3 (MACD Line > MACD Signal): {macd_line} > {macd_signal} = {condition3}")
+            
+            result = condition1 and condition2 and condition3
+            if debug:
+                print(f"   [Buy Signal Debug] Final result: {result}")
+            
+            return result
             
         except Exception as e:
             print(f"❌ Error checking buy signal: {e}")
             return False
             
-    def _check_sell_signal(self, row: pd.Series, current_price: float = None, entry_price: float = None) -> bool:
+    def _check_sell_signal(self, row: pd.Series, current_price: float = None, entry_price: float = None, debug: bool = False) -> bool:
         """
         Check if sell signal conditions are met.
         
@@ -438,6 +487,7 @@ class SignalProcessor:
             row: DataFrame row with indicator values
             current_price: Current price for stop loss calculation
             entry_price: Entry price for stop loss calculation
+            debug: Whether to show debug output (default: False)
             
         Returns:
             bool: True if sell signal conditions are met
@@ -446,6 +496,8 @@ class SignalProcessor:
             # Check for 5% stop loss first
             if current_price and entry_price:
                 unrealized_loss_percent = ((current_price - entry_price) / entry_price) * 100
+                if debug:
+                    print(f"   [Sell Signal Debug] Stop loss check: {unrealized_loss_percent:.2f}% loss")
                 if unrealized_loss_percent <= -5.0:  # 5% stop loss triggered
                     print(f"🛑 Stop loss triggered: {unrealized_loss_percent:.2f}% loss")
                     return True
@@ -459,6 +511,8 @@ class SignalProcessor:
             
             # Check if all required indicators are present
             if not (ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col):
+                if debug:
+                    print(f"   [Sell Signal Debug] Missing indicators - cannot check sell signal")
                 return False
                 
             # Get values
@@ -468,8 +522,13 @@ class SignalProcessor:
             macd_line = row[macd_line_col[0]]
             macd_signal = row[macd_signal_col[0]]
             
-            # Check for NaN values
-            if pd.isna(ema) or pd.isna(vwma) or pd.isna(roc) or pd.isna(macd_line) or pd.isna(macd_signal):
+            # Check for NaN values using multiple methods
+            def is_nan_value(value):
+                return pd.isna(value) or str(value).lower() == 'nan' or (isinstance(value, float) and math.isnan(value))
+            
+            if is_nan_value(ema) or is_nan_value(vwma) or is_nan_value(roc) or is_nan_value(macd_line) or is_nan_value(macd_signal):
+                if debug:
+                    print(f"   [Sell Signal Debug] NaN indicators - cannot check sell signal")
                 return False
                 
             # Check conditions
@@ -480,8 +539,20 @@ class SignalProcessor:
             # Count failed conditions
             failed_conditions = sum([not condition1, not condition2, not condition3])
             
+            # ENHANCED DEBUG: Show condition results
+            if debug:
+                print(f"   [Sell Signal Debug] Condition results:")
+                print(f"     Condition 1 (EMA > VWMA): {ema} > {vwma} = {condition1}")
+                print(f"     Condition 2 (ROC > 0): {roc} > 0 = {condition2}")
+                print(f"     Condition 3 (MACD Line > MACD Signal): {macd_line} > {macd_signal} = {condition3}")
+                print(f"     Failed conditions: {failed_conditions}")
+            
             # Sell signal: two or more conditions failed
-            return failed_conditions >= 2
+            result = failed_conditions >= 2
+            if debug:
+                print(f"   [Sell Signal Debug] Final result: {result}")
+            
+            return result
             
         except Exception as e:
             print(f"❌ Error checking sell signal: {e}")
@@ -503,12 +574,17 @@ class SignalProcessor:
         """
         symbol = symbol.upper()
         try:
-            # Debug: Entry point
-            print(f"\n🔍 [SignalProcessor] process_latest_signal called for {symbol} {timeframe}")
-            if 'close' in row:
-                print(f"   Close price: {row['close']}")
-            if 'datetime' in row:
-                print(f"   Datetime: {row['datetime']}")
+            # Debug: Entry point (only for streaming, not bootstrap)
+            if not is_historical:
+                print(f"\n🔍 [SignalProcessor] process_latest_signal called for {symbol} {timeframe}")
+                if 'close' in row:
+                    print(f"   Close price: {row['close']}")
+                if 'datetime' in row:
+                    print(f"   Datetime: {row['datetime']}")
+                
+                # NEW DEBUG: Print all column names to see what's available
+                print(f"   [Debug] All columns in row: {list(row.index)}")
+            
             # Parse datetime
             if 'datetime' in row:
                 dt_str = row['datetime']
@@ -521,20 +597,22 @@ class SignalProcessor:
                 dt = datetime.now(self.et_tz)
             current_price = row['close']
             key = self._get_trade_key(symbol, timeframe)
-            # Debug: Indicator values
-            try:
-                ema_col = [col for col in row.index if col.startswith('ema_')]
-                vwma_col = [col for col in row.index if col.startswith('vwma_')]
-                roc_col = [col for col in row.index if col.startswith('roc_')]
-                macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
-                macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
-                if ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col:
-                    print(f"   EMA: {row[ema_col[0]]}, VWMA: {row[vwma_col[0]]}, ROC: {row[roc_col[0]]}, MACD Line: {row[macd_line_col[0]]}, MACD Signal: {row[macd_signal_col[0]]}")
-            except Exception as e:
-                print(f"   [Debug] Could not print indicator values: {e}")
+            # Debug: Indicator values (only for streaming, not bootstrap)
+            if not is_historical:
+                try:
+                    ema_col = [col for col in row.index if col.startswith('ema_')]
+                    vwma_col = [col for col in row.index if col.startswith('vwma_')]
+                    roc_col = [col for col in row.index if col.startswith('roc_')]
+                    macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
+                    macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
+                    if ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col:
+                        print(f"   EMA: {row[ema_col[0]]}, VWMA: {row[vwma_col[0]]}, ROC: {row[roc_col[0]]}, MACD Line: {row[macd_line_col[0]]}, MACD Signal: {row[macd_signal_col[0]]}")
+                except Exception as e:
+                    print(f"   [Debug] Could not print indicator values: {e}")
             # Check for buy signal
-            buy_signal = self._check_buy_signal(row)
-            print(f"   [Debug] Buy signal check: {buy_signal}")
+            buy_signal = self._check_buy_signal(row, debug=not is_historical)
+            if not is_historical:
+                print(f"   [Debug] Buy signal check: {buy_signal}")
             if buy_signal:
                 if key not in self.open_trades:
                     # Open new trade
@@ -551,8 +629,9 @@ class SignalProcessor:
             # Check for sell signal on existing open trade
             if key in self.open_trades:
                 trade = self.open_trades[key]
-                sell_signal = self._check_sell_signal(row, current_price, trade.entry_price)
-                print(f"   [Debug] Sell signal check: {sell_signal}")
+                sell_signal = self._check_sell_signal(row, current_price, trade.entry_price, debug=not is_historical)
+                if not is_historical:
+                    print(f"   [Debug] Sell signal check: {sell_signal}")
                 if sell_signal:
                     # Close trade
                     trade.close_trade(dt, current_price)
@@ -566,9 +645,11 @@ class SignalProcessor:
                 else:
                     # Update unrealized P&L and max gain/loss for every row
                     trade.update_unrealized_pnl(current_price, dt)
-                    print(f"   [Debug] No sell signal. Updated unrealized P&L for open trade.")
+                    if not is_historical:
+                        print(f"   [Debug] No sell signal. Updated unrealized P&L for open trade.")
             else:
-                print(f"   [Debug] No open trade for {symbol} {timeframe}.")
+                if not is_historical:
+                    print(f"   [Debug] No open trade for {symbol} {timeframe}.")
             # Update max unrealized gain/loss for any existing open trade (even if no signals triggered)
             if key in self.open_trades:
                 trade = self.open_trades[key]
