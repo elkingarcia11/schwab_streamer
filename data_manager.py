@@ -95,6 +95,12 @@ from schwab_auth import SchwabAuth
 from indicator_generator import IndicatorGenerator
 from signal_processor import SignalProcessor
 import urllib.parse
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import asyncio
+import aiohttp
+from functools import lru_cache
+import multiprocessing as mp
 
 
 class DataManager:
@@ -124,10 +130,17 @@ class DataManager:
         self.market_close = datetime.strptime('16:00', '%H:%M').time()
 
     def get_symbols_from_file(self, symbols_filepath: str) -> List[str]:
-        """Get symbols from file separated by commas"""
+        """Get symbols from file separated by commas or newlines"""
         with open(symbols_filepath, 'r') as file:
-            symbols = file.read().split(',')
-            return [symbol.strip() for symbol in symbols if symbol.strip()]
+            content = file.read().strip()
+            
+            # Check if file uses comma separation or newline separation
+            if ',' in content:
+                symbols = content.split(',')
+            else:
+                symbols = content.split('\n')
+                
+            return [symbol.strip().upper() for symbol in symbols if symbol.strip()]
 
     def _extract_frequency_number(self, interval) -> int:
         """Extract numeric frequency from interval string (e.g., '5m' -> 5) or return int if already int"""
@@ -274,9 +287,9 @@ class DataManager:
 
             # Convert start and end dates to UNIX epoch milliseconds
             # Ensure datetime objects are timezone-aware before conversion
-            if current_start_dt.tzinfo is None:
+            if not current_start_dt.tzinfo:
                 current_start_dt = self.et_tz.localize(current_start_dt)
-            if current_end_dt.tzinfo is None:
+            if not current_end_dt.tzinfo:
                 current_end_dt = self.et_tz.localize(current_end_dt)
 
             # Print ET and UTC datetimes and ms epoch for debugging
@@ -487,7 +500,7 @@ class DataManager:
                     new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes, timeframe)
                     
                     if new_df is not None and len(new_df) > 0:
-                        # Filter out overlapping data
+                        # Filter out data that might overlap with existing data
                         new_df = new_df[new_df['timestamp'] > last_timestamp]
                         
                         if len(new_df) > 0:
@@ -770,6 +783,37 @@ class DataManager:
         """
         return self.signal_processor.email_weekly_summary()
         
+    def get_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str) -> Dict[str, float]:
+        """
+        Get a summary of trading signals and performance for a specific symbol and timeframe
+        
+        Args:
+            symbol: Trading symbol (e.g., 'SPY')
+            timeframe: Timeframe (e.g., '5m')
+            
+        Returns:
+            Dictionary with trade statistics for the specific symbol-timeframe
+        """
+        return self.signal_processor.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
+    
+    def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
+                                              subject: str = None, include_open_trades: bool = True) -> bool:
+        """
+        Send a comprehensive trade summary email for a specific symbol and timeframe
+        
+        Args:
+            symbol: Trading symbol (e.g., 'SPY')
+            timeframe: Timeframe (e.g., '5m')
+            subject: Custom email subject (optional)
+            include_open_trades: Whether to include current open trades in the email
+            
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        return self.signal_processor.email_trade_summary_by_symbol_timeframe(
+            symbol, timeframe, subject, include_open_trades
+        )
+        
     def reset_trades(self, symbol: str = None, timeframe: str = None):
         """
         Reset trades for specific symbol/timeframe or all trades
@@ -791,6 +835,35 @@ class DataManager:
             # Reset specific symbol/timeframe
             symbol = symbol.upper()
             print(f"🔄 Reset trades for {symbol} {timeframe}")
+
+    def _generate_inverse_row(self, row: pd.Series) -> pd.Series:
+        """
+        Generate inverse OHLC data from a single row of original symbol data.
+        
+        Args:
+            row: Series with OHLCV data
+            
+        Returns:
+            Series with inverse OHLC data (1/price) and same volume/timestamps
+        """
+        inverse_row = row.copy()
+        
+        # Generate inverse prices (1/price)
+        inverse_row['open'] = 1.0 / row['open']
+        inverse_row['high'] = 1.0 / row['high']
+        inverse_row['low'] = 1.0 / row['low']
+        inverse_row['close'] = 1.0 / row['close']
+        
+        # Note: For inverse data, we need to swap high/low since 1/high < 1/low
+        # when original high > low
+        temp_high = inverse_row['high']
+        inverse_row['high'] = inverse_row['low']
+        inverse_row['low'] = temp_high
+        
+        # Keep volume, timestamps, and indicators the same
+        # (volume, timestamp, and indicator columns remain unchanged)
+        
+        return inverse_row
 
     def _generate_inverse_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -825,47 +898,338 @@ class DataManager:
         print(f"🔄 Generated inverse data with {len(inverse_df)} rows")
         return inverse_df
 
+    # ======================== PARALLEL PROCESSING METHODS ========================
+    
+    def process_symbol_timeframe_parallel(self, symbol: str, timeframe: str, 
+                                        ema_period: Dict, vwma_period: Dict, roc_period: Dict,
+                                        fast_ema: Dict, slow_ema: Dict, signal_ema: Dict) -> Tuple[str, str, bool]:
+        """
+        Process a single symbol-timeframe combination (for parallel execution)
+        
+        Returns:
+            Tuple of (symbol, timeframe, success)
+        """
+        try:
+            print(f"🔄 Processing {symbol} {timeframe}")
+            result = self.fetchLatestWithSignals(
+                symbol, timeframe,
+                ema_period=ema_period.get(timeframe, 7),
+                vwma_period=vwma_period.get(timeframe, 6), 
+                roc_period=roc_period.get(timeframe, 11),
+                fast_ema=fast_ema.get(timeframe, 21),
+                slow_ema=slow_ema.get(timeframe, 37),
+                signal_ema=signal_ema.get(timeframe, 15)
+            )
+            success = result is not None and len(result) > 0
+            print(f"✅ Completed {symbol} {timeframe} - {'Success' if success else 'Failed'}")
+            return symbol, timeframe, success
+        except Exception as e:
+            print(f"❌ Error processing {symbol} {timeframe}: {str(e)}")
+            return symbol, timeframe, False
+    
+    def process_symbols_parallel(self, symbols: List[str], timeframes: List[str],
+                               ema_period: Dict, vwma_period: Dict, roc_period: Dict,
+                               fast_ema: Dict, slow_ema: Dict, signal_ema: Dict,
+                               max_workers: int = None) -> Dict[str, Dict[str, bool]]:
+        """
+        Process multiple symbols and timeframes in parallel using ThreadPoolExecutor
+        
+        Args:
+            symbols: List of symbols to process
+            timeframes: List of timeframes to process
+            max_workers: Maximum number of parallel workers (default: CPU count)
+            
+        Returns:
+            Dict with results: {symbol: {timeframe: success}}
+        """
+        if max_workers is None:
+            max_workers = min(len(symbols) * len(timeframes), mp.cpu_count() * 2)
+        
+        print(f"🚀 Starting parallel processing with {max_workers} workers")
+        print(f"📊 Processing {len(symbols)} symbols × {len(timeframes)} timeframes = {len(symbols) * len(timeframes)} combinations")
+        
+        # Create all symbol-timeframe combinations
+        tasks = []
+        for symbol in symbols:
+            for timeframe in timeframes:
+                tasks.append((symbol, timeframe))
+        
+        results = {}
+        completed_count = 0
+        total_tasks = len(tasks)
+        
+        # Use ThreadPoolExecutor for I/O bound operations (API calls)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(
+                    self.process_symbol_timeframe_parallel,
+                    symbol, timeframe, ema_period, vwma_period, roc_period,
+                    fast_ema, slow_ema, signal_ema
+                ): (symbol, timeframe) 
+                for symbol, timeframe in tasks
+            }
+            
+            # Process completed tasks
+            for future in as_completed(future_to_task):
+                symbol, timeframe = future_to_task[future]
+                try:
+                    result_symbol, result_timeframe, success = future.result()
+                    
+                    if result_symbol not in results:
+                        results[result_symbol] = {}
+                    results[result_symbol][result_timeframe] = success
+                    
+                    completed_count += 1
+                    progress = (completed_count / total_tasks) * 100
+                    print(f"📈 Progress: {completed_count}/{total_tasks} ({progress:.1f}%)")
+                    
+                except Exception as e:
+                    print(f"❌ Task failed for {symbol} {timeframe}: {str(e)}")
+                    if symbol not in results:
+                        results[symbol] = {}
+                    results[symbol][timeframe] = False
+        
+        return results
+    
+    @lru_cache(maxsize=128)
+    def _cached_api_call(self, url: str, headers_tuple: tuple) -> Optional[str]:
+        """
+        Cached API call to avoid duplicate requests
+        
+        Args:
+            url: API endpoint URL
+            headers_tuple: Headers as tuple (for hashability)
+            
+        Returns:
+            Response text or None
+        """
+        try:
+            headers = dict(headers_tuple)
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code == 200:
+                return response.text
+            else:
+                print(f"❌ API call failed: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"❌ Cached API call error: {str(e)}")
+            return None
+    
+    def batch_process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, 
+                            batch_size: int = 100) -> List:
+        """
+        Process signals in batches for better performance
+        
+        Args:
+            symbol: Trading symbol
+            timeframe: Time interval
+            df: DataFrame with OHLCV data and indicators
+            batch_size: Number of rows to process per batch
+            
+        Returns:
+            List of all trades from batch processing
+        """
+        if df is None or len(df) == 0:
+            return []
+        
+        all_trades = []
+        total_rows = len(df)
+        
+        print(f"🔄 Batch processing {total_rows} rows in batches of {batch_size}")
+        
+        for i in range(0, total_rows, batch_size):
+            end_idx = min(i + batch_size, total_rows)
+            batch_df = df.iloc[i:end_idx]
+            
+            # Process each row in the batch
+            for idx, row in batch_df.iterrows():
+                trade = self.process_latest_signal(symbol, timeframe, row)
+                if trade:
+                    all_trades.append(trade)
+            
+            progress = (end_idx / total_rows) * 100
+            print(f"📊 Batch progress: {end_idx}/{total_rows} ({progress:.1f}%)")
+        
+        return all_trades
+    
+    def optimize_memory_usage(self):
+        """
+        Optimize memory usage by cleaning up old data and forcing garbage collection
+        """
+        import gc
+        
+        # Clear old DataFrames that are no longer needed
+        keys_to_remove = []
+        for key, df in self.latestDF.items():
+            if df is not None and len(df) > 10000:  # Keep only recent data
+                # Keep only last 5000 rows
+                self.latestDF[key] = df.tail(5000).copy()
+                print(f"🧹 Trimmed {key} from {len(df)} to 5000 rows")
+        
+        # Force garbage collection
+        gc.collect()
+        print("🧹 Memory optimization completed")
+    
+    def get_processing_stats(self) -> Dict[str, int]:
+        """
+        Get statistics about current data processing state
+        
+        Returns:
+            Dict with processing statistics
+        """
+        stats = {
+            'total_dataframes': len(self.latestDF),
+            'total_rows': sum(len(df) if df is not None else 0 for df in self.latestDF.values()),
+            'memory_usage_mb': sum(df.memory_usage(deep=True).sum() if df is not None else 0 
+                                 for df in self.latestDF.values()) / (1024 * 1024),
+            'open_trades': len(self.get_open_trades()),
+            'total_trades': len(self.get_all_trades())
+        }
+        return stats
+
 
 if __name__ == "__main__":
-    # Example usage
+    # Example usage with parallel processing optimization
+    print("🚀 Starting Optimized Data Manager with Parallel Processing")
+    start_time = time.time()
+    
     data_manager = DataManager()
     
-    # Define indicator parameters
-    ema_period = 7
-    vwma_period = 17
-    roc_period = 8
-    fast_ema = 12
-    slow_ema = 26
-    signal_ema = 9
+    # Define indicator parameters based on timeframe
+    ema_period = {
+        "1m": 5,
+        "5m": 7,
+        "10m": 9,
+        "15m": 6,
+        "30m": 6
+    }
+    vwma_period = {
+        "1m": 16,
+        "5m": 6,
+        "10m": 5,
+        "15m": 4,
+        "30m": 2
+    }
+    roc_period = {
+        "1m": 6,
+        "5m": 11,
+        "10m": 10,
+        "15m": 7,
+        "30m": 5
+    }
+    fast_ema = {
+        "1m": 15,
+        "5m": 21,
+        "10m": 16,
+        "15m": 14,
+        "30m": 22
+    }
+    slow_ema = {
+        "1m": 39,
+        "5m": 37,
+        "10m": 31,
+        "15m": 30,
+        "30m": 39
+    }
+    signal_ema = {
+        "1m": 11,
+        "5m": 15,
+        "10m": 10,
+        "15m": 10,
+        "30m": 12
+    }
     
-    # Fetch data and process signals automatically for both SPY and SPY_inverse
-    result = data_manager.fetchLatestWithSignals(
-        "SPY", "5m",
-        ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
-        fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema
-    )
+    # Import symbols from symbols.txt
+    symbols = data_manager.get_symbols_from_file("symbols.txt")
+    timeframes = ["1m", "5m", "10m", "15m", "30m"]
     
-    if result is not None:
-        print(f"✅ Successfully fetched {len(result)} records for SPY 5m")
-        print("Last row of SPY:")
-        print(result.tail(1))
+    print(f"📊 Loaded {len(symbols)} symbols: {', '.join(symbols)}")
+    print(f"⏱️  Processing {len(timeframes)} timeframes: {', '.join(timeframes)}")
+    
+    # Option 1: Use parallel processing (recommended for multiple symbols/timeframes)
+    if len(symbols) > 1 or len(timeframes) > 2:
+        print("\n🚀 Using PARALLEL PROCESSING mode")
         
-        # Check if inverse data was also generated
-        inverse_df = data_manager.latestDF.get("SPY_INVERSE_5m")
-        if inverse_df is not None:
-            print(f"✅ Successfully generated {len(inverse_df)} records for SPY_inverse 5m")
-            print("Last row of SPY_inverse:")
-            print(inverse_df.tail(1))
+        # Process all symbols and timeframes in parallel
+        results = data_manager.process_symbols_parallel(
+            symbols=symbols,
+            timeframes=timeframes,
+            ema_period=ema_period,
+            vwma_period=vwma_period,
+            roc_period=roc_period,
+            fast_ema=fast_ema,
+            slow_ema=slow_ema,
+            signal_ema=signal_ema,
+            max_workers=None  # Auto-detect optimal number of workers
+        )
         
-        # Get trade summary (includes both original and inverse trades)
-        summary = data_manager.get_trade_summary()
-        print(f"📊 Trade Summary - Win Rate: {summary['win_rate']:.1f}%")
-        print(f"📊 Total Trades: {summary['total_trades']} (includes both original and inverse)")
+        # Print results summary
+        print("\n📊 PARALLEL PROCESSING RESULTS:")
+        total_success = 0
+        total_tasks = 0
+        for symbol, timeframe_results in results.items():
+            for timeframe, success in timeframe_results.items():
+                total_tasks += 1
+                if success:
+                    total_success += 1
+                status = "✅" if success else "❌"
+                print(f"{status} {symbol} {timeframe}")
         
-        # Get open trades
-        open_trades = data_manager.get_open_trades()
-        print(f"📊 Open Trades: {len(open_trades)}")
-        for key, trade in open_trades.items():
-            print(f"  {trade.symbol} {trade.timeframe}: Entry {trade.entry_price:.2f}, P&L {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
+        success_rate = (total_success / total_tasks) * 100 if total_tasks > 0 else 0
+        print(f"\n🎯 Success Rate: {total_success}/{total_tasks} ({success_rate:.1f}%)")
+        
     else:
-        print("❌ Failed to fetch data")
+        print("\n🔄 Using SEQUENTIAL PROCESSING mode (single symbol/few timeframes)")
+        
+        # Sequential processing for single symbol or few timeframes
+        for symbol in symbols:
+            for timeframe in timeframes:
+                print(f"🔄 Processing {symbol} {timeframe}")
+                result = data_manager.fetchLatestWithSignals(
+                    symbol, timeframe,
+                    ema_period=ema_period.get(timeframe, 7),
+                    vwma_period=vwma_period.get(timeframe, 6),
+                    roc_period=roc_period.get(timeframe, 11),
+                    fast_ema=fast_ema.get(timeframe, 21),
+                    slow_ema=slow_ema.get(timeframe, 37),
+                    signal_ema=signal_ema.get(timeframe, 15)
+                )
+                
+                if result is not None and len(result) > 0:
+                    print(f"✅ Successfully processed {symbol} {timeframe}")
+                else:
+                    print(f"❌ Failed to process {symbol} {timeframe}")
+    
+    # Memory optimization
+    print("\n🧹 Optimizing memory usage...")
+    data_manager.optimize_memory_usage()
+    
+    # Get processing statistics
+    stats = data_manager.get_processing_stats()
+    print(f"\n📊 PROCESSING STATISTICS:")
+    print(f"📈 Total DataFrames: {stats['total_dataframes']}")
+    print(f"📊 Total Rows: {stats['total_rows']:,}")
+    print(f"💾 Memory Usage: {stats['memory_usage_mb']:.1f} MB")
+    print(f"📈 Open Trades: {stats['open_trades']}")
+    print(f"📊 Total Trades: {stats['total_trades']}")
+    
+    # Send email summary
+    print("\n📧 Sending email summary...")
+    email_success = data_manager.email_trade_summary()
+    if email_success:
+        print("✅ Email sent successfully")
+    else:
+        print("❌ Email sending failed")
+    
+    # Calculate and display total execution time
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"\n⏱️  TOTAL EXECUTION TIME: {execution_time:.2f} seconds")
+    
+    # Performance metrics
+    if len(symbols) * len(timeframes) > 1:
+        avg_time_per_task = execution_time / (len(symbols) * len(timeframes))
+        print(f"⚡ Average time per symbol-timeframe: {avg_time_per_task:.2f} seconds")
+    
+    print("🎉 Data Manager execution completed!")

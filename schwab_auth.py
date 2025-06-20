@@ -73,7 +73,7 @@ class SchwabAuth:
 
     def should_refresh_token_proactively(self) -> bool:
         """Check if we should proactively refresh token"""
-        if self.last_token_refresh is None:
+        if not self.last_token_refresh:
             return True
             
         time_since_refresh = time_module.time() - self.last_token_refresh
@@ -278,8 +278,7 @@ class SchwabAuth:
             return {}
         
         return {
-            'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json'
+            'Authorization': f'Bearer {access_token}'
         }
 
     def is_authenticated(self) -> bool:

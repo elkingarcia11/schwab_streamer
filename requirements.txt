@@ -7,3 +7,4 @@ pandas
 pandas-ta
 setuptools
 numpy==1.24.4
+aiohttp

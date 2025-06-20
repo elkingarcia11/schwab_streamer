@@ -87,7 +87,6 @@ FEATURES:
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 import os
@@ -113,7 +112,7 @@ class Trade:
         self.trade_duration = None
         self.is_open = True
         
-    def update_unrealized_pnl(self, current_price: float, current_time: datetime):
+    def update_unrealized_pnl(self, current_price: float, current_time: datetime = None):
         """Update unrealized P&L and track max gain/loss"""
         if not self.is_open:
             return
@@ -160,7 +159,7 @@ class Trade:
         
         # Parse entry time
         entry_time = datetime.strptime(data['entry_time'], '%Y-%m-%d %H:%M:%S %Z')
-        if entry_time.tzinfo is None:
+        if not entry_time.tzinfo:
             entry_time = et_tz.localize(entry_time)
             
         # Create trade
@@ -169,7 +168,7 @@ class Trade:
         # Set other attributes if trade is closed
         if not data['is_open'] and data['exit_time']:
             exit_time = datetime.strptime(data['exit_time'], '%Y-%m-%d %H:%M:%S %Z')
-            if exit_time.tzinfo is None:
+            if not exit_time.tzinfo:
                 exit_time = et_tz.localize(exit_time)
             trade.close_trade(exit_time, data['exit_price'])
         
@@ -202,6 +201,10 @@ class SignalProcessor:
         self.open_trades: Dict[Tuple[str, str], Trade] = {}
         # List of all trades (open and closed)
         self.all_trades: List[Trade] = []
+        
+        # Counter for periodic saving of open trades (to persist max unrealized values)
+        self.update_counter = 0
+        self.save_open_trades_interval = 50  # Save open trades every 50 updates
         
         # Initialize email manager
         self.email_manager = EmailManager()
@@ -305,7 +308,7 @@ class SignalProcessor:
             
     def _save_trades_batch(self, trades: List[Trade] = None):
         """Save multiple trades efficiently (for batch operations)"""
-        if trades is None:
+        if not trades:
             trades = self.all_trades
             
         try:
@@ -387,7 +390,7 @@ class SignalProcessor:
         """
         try:
             # Check for 5% stop loss first
-            if current_price is not None and entry_price is not None:
+            if current_price and entry_price:
                 unrealized_loss_percent = ((current_price - entry_price) / entry_price) * 100
                 if unrealized_loss_percent <= -5.0:  # 5% stop loss triggered
                     print(f"🛑 Stop loss triggered: {unrealized_loss_percent:.2f}% loss")
@@ -430,7 +433,7 @@ class SignalProcessor:
             print(f"❌ Error checking sell signal: {e}")
             return False
             
-    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series, save_to_csv: bool = True) -> Optional[Trade]:
+    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series, save_to_csv: bool = True, is_historical: bool = False) -> Optional[Trade]:
         """
         Process signal for latest incoming data (single row).
         
@@ -439,6 +442,7 @@ class SignalProcessor:
             timeframe: Timeframe
             row: DataFrame row with OHLCV data and indicators
             save_to_csv: Whether to save trade changes to CSV (default: True)
+            is_historical: Whether this is historical data processing (default: False)
             
         Returns:
             Optional[Trade]: New trade if opened, None otherwise
@@ -470,7 +474,10 @@ class SignalProcessor:
                     if save_to_csv:
                         self._save_new_trade(trade)  # Efficiently save new trade
                     print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
-                    self._send_buy_email(trade)  # Send buy email notification
+                    
+                    # Only send email for real-time signals, not historical
+                    if not is_historical:
+                        self._send_buy_email(trade)  # Send buy email notification
                     return trade
                     
             # Check for sell signal on existing open trade
@@ -483,7 +490,10 @@ class SignalProcessor:
                     if save_to_csv:
                         self._update_trade_in_csv(trade)  # Update existing trade
                     print(f"🔴 SELL: Closed trade for {symbol} {timeframe} at {current_price:.2f}, P&L: {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
-                    self._send_sell_email(trade)  # Send sell email notification
+                    
+                    # Only send email for real-time signals, not historical
+                    if not is_historical:
+                        self._send_sell_email(trade)  # Send sell email notification
                 else:
                     # Update unrealized P&L and max gain/loss for every row
                     trade.update_unrealized_pnl(current_price, dt)
@@ -493,6 +503,14 @@ class SignalProcessor:
             if key in self.open_trades:
                 trade = self.open_trades[key]
                 trade.update_unrealized_pnl(current_price, dt)
+            
+            # Periodically save open trades to persist max unrealized gain/loss values
+            # Only for real-time processing (not historical) to avoid excessive writes
+            if not is_historical and self.open_trades:
+                self.update_counter += 1
+                if self.update_counter >= self.save_open_trades_interval:
+                    self._save_open_trades_to_csv()
+                    self.update_counter = 0  # Reset counter
                     
         except Exception as e:
             print(f"❌ Error processing latest signal for {symbol} {timeframe}: {e}")
@@ -518,8 +536,8 @@ class SignalProcessor:
         
         for index, row in df.iterrows():
             try:
-                # Use process_latest_signal with save_to_csv=False for efficiency
-                new_trade = self.process_latest_signal(symbol, timeframe, row, save_to_csv=False)
+                # Use process_latest_signal with save_to_csv=False and is_historical=True for efficiency
+                new_trade = self.process_latest_signal(symbol, timeframe, row, save_to_csv=False, is_historical=True)
                 if new_trade:
                     trades.append(new_trade)
                         
@@ -530,6 +548,11 @@ class SignalProcessor:
         # Save all trades to CSV efficiently (batch save for historical processing)
         if trades:
             self._save_trades_batch()
+        
+        # Save open trades to persist max unrealized gain/loss values
+        if self.open_trades:
+            self._save_open_trades_to_csv()
+            print(f"💾 Persisted max unrealized values for {len(self.open_trades)} open trades")
         
         print(f"✅ Processed {len(trades)} new trades from historical data")
         return trades
@@ -573,6 +596,93 @@ class SignalProcessor:
             'win_rate': win_rate
         }
         
+    def get_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str) -> dict:
+        """
+        Get trade summary for a specific symbol and timeframe combination.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'SPY')
+            timeframe: Timeframe (e.g., '5m')
+            
+        Returns:
+            Dictionary with trade statistics for the specific symbol-timeframe
+        """
+        symbol = symbol.upper()
+        trade_key = (symbol, timeframe)
+        
+        # Filter trades for this specific symbol-timeframe
+        all_trades = self.get_all_trades()
+        filtered_trades = [trade for trade in all_trades 
+                          if trade.symbol == symbol and trade.timeframe == timeframe]
+        
+        # Get closed trades for calculations
+        closed_trades = [trade for trade in filtered_trades if not trade.is_open]
+        
+        if not closed_trades:
+            # Check if there's an open trade
+            open_trade = self.open_trades.get(trade_key)
+            return {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'win_rate': 0.0,
+                'total_pnl': 0.0,
+                'avg_win': 0.0,
+                'avg_loss': 0.0,
+                'max_win': 0.0,
+                'max_loss': 0.0,
+                'avg_trade_duration_hours': 0.0,
+                'open_trades_count': 1 if open_trade else 0,
+                'open_trades_pnl': open_trade.pnl if open_trade else 0.0,
+                'current_unrealized_gain': open_trade.max_unrealized_gain if open_trade else 0.0,
+                'current_unrealized_loss': open_trade.max_unrealized_loss if open_trade else 0.0
+            }
+        
+        # Calculate statistics for this symbol-timeframe
+        total_trades = len(closed_trades)
+        winning_trades = len([t for t in closed_trades if t.pnl > 0])
+        losing_trades = len([t for t in closed_trades if t.pnl <= 0])
+        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        
+        total_pnl = sum(trade.pnl for trade in closed_trades)
+        
+        wins = [t.pnl for t in closed_trades if t.pnl > 0]
+        losses = [t.pnl for t in closed_trades if t.pnl <= 0]
+        
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        max_win = max(wins) if wins else 0
+        max_loss = min(losses) if losses else 0
+        
+        # Calculate average trade duration
+        durations = [trade.trade_duration.total_seconds() / 3600 
+                    for trade in closed_trades if trade.trade_duration]
+        avg_duration_hours = sum(durations) / len(durations) if durations else 0
+        
+        # Get open trade info
+        open_trade = self.open_trades.get(trade_key)
+        
+        return {
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'total_trades': total_trades,
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'max_win': max_win,
+            'max_loss': max_loss,
+            'avg_trade_duration_hours': avg_duration_hours,
+            'open_trades_count': 1 if open_trade else 0,
+            'open_trades_pnl': open_trade.pnl if open_trade else 0.0,
+            'current_unrealized_gain': open_trade.max_unrealized_gain if open_trade else 0.0,
+            'current_unrealized_loss': open_trade.max_unrealized_loss if open_trade else 0.0
+        }
+        
     def email_trade_summary(self, subject: str = None, include_open_trades: bool = True) -> bool:
         """
         Send a comprehensive trade summary email
@@ -594,7 +704,7 @@ class SignalProcessor:
                 open_trades_list = self.get_open_trades()
             
             # Create subject
-            if subject is None:
+            if subject:
                 pnl_emoji = "📈" if summary['total_pnl'] >= 0 else "📉"
                 subject = f"{pnl_emoji} Trade Summary - {summary['closed_trades']} Closed, {summary['open_trades']} Open"
             
@@ -753,6 +863,146 @@ class SignalProcessor:
             
         except Exception as e:
             print(f"❌ Error sending sell email: {e}")
+
+    def _save_open_trades_to_csv(self):
+        """Save current open trades to CSV to persist max unrealized gain/loss"""
+        try:
+            if not self.open_trades:
+                return
+                
+            if not os.path.exists(self.trades_csv_path):
+                return
+                
+            # Read existing trades
+            df = pd.read_csv(self.trades_csv_path)
+            
+            # Update each open trade in the CSV
+            for trade in self.open_trades.values():
+                mask = (
+                    (df['symbol'] == trade.symbol) & 
+                    (df['timeframe'] == trade.timeframe) & 
+                    (df['entry_time'] == trade.entry_time.strftime('%Y-%m-%d %H:%M:%S %Z'))
+                )
+                
+                if mask.any():
+                    # Update the trade data with current max unrealized values
+                    trade_dict = trade.to_dict()
+                    for key, value in trade_dict.items():
+                        df.loc[mask, key] = value
+            
+            # Save updated DataFrame
+            df.to_csv(self.trades_csv_path, index=False)
+            print(f"💾 Updated {len(self.open_trades)} open trades with max unrealized values")
+                
+        except Exception as e:
+            print(f"❌ Error saving open trades to CSV: {e}")
+
+    def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
+                                              subject: str = None, include_open_trades: bool = True) -> bool:
+        """
+        Send a comprehensive trade summary email for a specific symbol and timeframe.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'SPY')
+            timeframe: Timeframe (e.g., '5m')
+            subject: Custom email subject (optional)
+            include_open_trades: Whether to include current open trades in the email
+            
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        try:
+            symbol = symbol.upper()
+            
+            # Get trade summary for this specific symbol-timeframe
+            summary = self.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
+            
+            if not subject:
+                subject = f"Trade Summary: {symbol} {timeframe} - {summary['total_trades']} Trades, {summary['win_rate']:.1f}% Win Rate"
+            
+            # Build email body
+            body = f"""
+📊 TRADE SUMMARY REPORT: {symbol} {timeframe}
+{'=' * 50}
+
+📈 PERFORMANCE METRICS:
+• Total Trades: {summary['total_trades']}
+• Winning Trades: {summary['winning_trades']}
+• Losing Trades: {summary['losing_trades']}
+• Win Rate: {summary['win_rate']:.1f}%
+
+💰 PROFIT & LOSS:
+• Total P&L: ${summary['total_pnl']:.2f}
+• Average Win: ${summary['avg_win']:.2f}
+• Average Loss: ${summary['avg_loss']:.2f}
+• Best Trade: ${summary['max_win']:.2f}
+• Worst Trade: ${summary['max_loss']:.2f}
+
+⏱️ TRADE DURATION:
+• Average Duration: {summary['avg_trade_duration_hours']:.2f} hours
+
+"""
+            
+            # Add open trades section if requested and trades exist
+            if include_open_trades and summary['open_trades_count'] > 0:
+                body += f"""
+🔄 CURRENT OPEN TRADES: {summary['open_trades_count']}
+• Current P&L: ${summary['open_trades_pnl']:.2f} ({(summary['open_trades_pnl']/100)*100:.2f}%)
+• Max Unrealized Gain: ${summary['current_unrealized_gain']:.2f}
+• Max Unrealized Loss: ${summary['current_unrealized_loss']:.2f}
+
+"""
+            
+            # Add detailed trade history if there are trades
+            if summary['total_trades'] > 0:
+                body += f"""
+📋 DETAILED TRADE HISTORY:
+{'=' * 30}
+
+"""
+                # Get all trades for this symbol-timeframe
+                all_trades = self.get_all_trades()
+                symbol_trades = [trade for trade in all_trades 
+                               if trade.symbol == symbol and trade.timeframe == timeframe]
+                
+                # Sort by entry time
+                symbol_trades.sort(key=lambda x: x.entry_time)
+                
+                for i, trade in enumerate(symbol_trades[-10:], 1):  # Show last 10 trades
+                    status = "🔄 OPEN" if trade.is_open else "✅ CLOSED"
+                    entry_time = trade.entry_time.strftime('%Y-%m-%d %H:%M')
+                    
+                    if trade.is_open:
+                        body += f"{i:2d}. {status} | Entry: {entry_time} @ ${trade.entry_price:.2f} | Current P&L: ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%)\n"
+                    else:
+                        exit_time = trade.exit_time.strftime('%Y-%m-%d %H:%M')
+                        duration_hours = trade.trade_duration.total_seconds() / 3600 if trade.trade_duration else 0
+                        profit_indicator = "📈" if trade.pnl > 0 else "📉"
+                        body += f"{i:2d}. {status} | {entry_time} → {exit_time} | ${trade.entry_price:.2f} → ${trade.exit_price:.2f} | {profit_indicator} ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%) | {duration_hours:.1f}h\n"
+                
+                if len(symbol_trades) > 10:
+                    body += f"\n... and {len(symbol_trades) - 10} more trades\n"
+            
+            body += f"""
+
+📧 Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🤖 Automated Trading System
+"""
+            
+            # Send email
+            email_manager = EmailManager()
+            success = email_manager.send_email(subject, body)
+            
+            if success:
+                print(f"✅ Trade summary email sent for {symbol} {timeframe}")
+            else:
+                print(f"❌ Failed to send trade summary email for {symbol} {timeframe}")
+                
+            return success
+            
+        except Exception as e:
+            print(f"❌ Failed to send trade summary email for {symbol} {timeframe}: {str(e)}")
+            return False
 
 
 if __name__ == "__main__":

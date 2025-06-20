@@ -135,7 +135,7 @@ class IndicatorGenerator:
             
             # Calculate EMA for new data points
             if ema_period:
-                if last_vals['ema'] is None:
+                if not last_vals['ema']:
                     # First time, calculate EMA for all data
                     result_df[f'ema_{ema_period}'] = result_df['close'].ewm(span=ema_period, adjust=False).mean()
                     last_vals['ema'] = result_df[f'ema_{ema_period}'].iloc[-1]
@@ -203,7 +203,7 @@ class IndicatorGenerator:
                 macd_signal_values = []
                 
                 # Update fast and slow EMAs
-                if last_vals['macd_fast_ema'] is None:
+                if not last_vals['macd_fast_ema']:
                     # First time, calculate EMAs for all data
                     fast_ema_series = result_df['close'].ewm(span=fast_ema, adjust=False).mean()
                     slow_ema_series = result_df['close'].ewm(span=slow_ema, adjust=False).mean()

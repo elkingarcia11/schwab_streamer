@@ -328,8 +328,10 @@ Happy trading! 📈📉
             buy_time = signal_details.get('buy_time')
             sell_time = signal_details.get('sell_time')
             entry_time = signal_details.get('entry_time')
-            # Drop the -4:00 from the end of the string
-            entry_time = entry_time.split('-')[0]
+            if entry_time and isinstance(entry_time, str):
+                entry_time = entry_time.split('-')[0]
+            else:
+                entry_time = None
             
             # Create subject based on action and position type
             if action == 'BUY':
