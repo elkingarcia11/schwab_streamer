@@ -533,24 +533,15 @@ class SchwabStreamerClient:
             if len(df_with_indicators) > 0:
                 latest_row_with_indicators = df_with_indicators.iloc[-1]
                 self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
-            
             # Process signals for the new row only (real-time processing)
             if len(df_with_indicators) > 0:
                 latest_row = df_with_indicators.iloc[-1]
-                
-                # Check if we have enough data for signal processing (need indicators)
-                required_columns = ['ema', 'vwma', 'roc', 'macd_line', 'macd_signal']
-                if all(col in latest_row.index and pd.notna(latest_row[col]) for col in required_columns):
-                    # Process signal for the latest row (is_historical=False for real-time email notifications)
-                    self.data_manager.signal_processor.process_latest_signal(
-                        symbol, timeframe, latest_row, is_historical=False
-                    )
-                    
-                    if self.debug:
-                        print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
-                else:
-                    if self.debug:
-                        print(f"⏳ Insufficient data for signal processing {symbol} {timeframe} (need more historical data)")
+                # Always process the latest row for signals, even if indicators are NaN
+                self.data_manager.signal_processor.process_latest_signal(
+                    symbol, timeframe, latest_row, is_historical=False
+                )
+                if self.debug:
+                    print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
             
             # Also process inverse symbol if it's a base symbol
             if not symbol.endswith('_inverse'):
@@ -829,25 +820,16 @@ class SchwabStreamerClient:
             if len(df_with_indicators) > 0:
                 latest_row_with_indicators = df_with_indicators.iloc[-1]
                 self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
-            
             # Process signals for the new row only (real-time processing)
             if len(df_with_indicators) > 0:
                 latest_row = df_with_indicators.iloc[-1]
+                # Always process the latest row for signals, even if indicators are NaN
+                self.data_manager.signal_processor.process_latest_signal(
+                    symbol, timeframe, latest_row, is_historical=False
+                )
                 
-                # Check if we have enough data for signal processing (need indicators)
-                required_columns = ['ema', 'vwma', 'roc', 'macd_line', 'macd_signal']
-                if all(col in latest_row.index and pd.notna(latest_row[col]) for col in required_columns):
-                    # Process signal for the latest row (is_historical=False for real-time email notifications)
-                    self.data_manager.signal_processor.process_latest_signal(
-                        symbol, timeframe, latest_row, is_historical=False
-                    )
-                    
-                    if self.debug:
-                        print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
-                else:
-                    if self.debug:
-                        print(f"⏳ Insufficient data for signal processing {symbol} {timeframe} (need more historical data)")
-            
+                if self.debug:
+                    print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
             # Print confirmation (only in debug mode to avoid spam)
             if self.debug:
                 print(f"✅ Processed new {timeframe} candle: {symbol} @ {timestamp_dt.strftime('%H:%M:%S')} Close=${candle_data['close']:.2f}")
