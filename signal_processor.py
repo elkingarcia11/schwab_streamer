@@ -1098,6 +1098,25 @@ class SignalProcessor:
         return any(trade.symbol == symbol and trade.timeframe == timeframe 
                   for trade in self.all_trades)
 
+    def drop_closed_trades_and_save_only_open(self):
+        """Drop all closed trades from CSV and keep only open trades."""
+        if os.path.exists(self.trades_csv_path):
+            try:
+                df = pd.read_csv(self.trades_csv_path)
+                if 'is_open' in df.columns:
+                    open_trades = df[df['is_open'] == True]
+                    open_trades.to_csv(self.trades_csv_path, index=False)
+                    print(f"🧹 Dropped closed trades, kept {len(open_trades)} open trades in {self.trades_csv_path}")
+            except Exception as e:
+                print(f"❌ Error dropping closed trades: {e}")
+
+    def send_trades_csv_after_4pm(self):
+        """Send the trades.csv file via email after 4pm ET."""
+        now = datetime.now(self.et_tz)
+        if now.hour >= 16:
+            subject = f"Trade Log for {now.strftime('%Y-%m-%d')}"
+            body = "Attached is the trade log for today."
+            self.email_manager.send_trade_log_email(self.trades_csv_path, subject=subject, body=body)
 
 if __name__ == "__main__":
     # Example usage

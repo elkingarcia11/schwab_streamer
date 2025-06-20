@@ -1240,6 +1240,11 @@ class DataManager:
         print("\n🧹 Optimizing memory usage...")
         self.optimize_memory_usage()
         
+        # After bootstrap, drop closed trades and keep only open trades
+        self.signal_processor.drop_closed_trades_and_save_only_open()
+        # After 4pm, send trades.csv via email
+        self.signal_processor.send_trades_csv_after_4pm()
+
         # Get processing statistics
         stats = self.get_processing_stats()
         print(f"\n📊 PROCESSING STATISTICS:")
