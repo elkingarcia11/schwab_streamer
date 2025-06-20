@@ -1,4 +1,3 @@
-
 import json
 import time
 import threading
@@ -28,7 +27,7 @@ class SchwabStreamerClient:
 
         
         # Candle aggregation buffers for higher timeframes
-        self.candle_buffers = self.initialize_candle_buffer(self.equity_symbols, self.timeframes) # Store 1m candles for aggregation
+        self.candle_buffers = {}
 
         self.daily_email_sent = False  # Track if 4pm email was sent today
         self.last_email_date = None    # Track the date when last email was sent
@@ -457,7 +456,7 @@ class SchwabStreamerClient:
                 print(f"⚠️ No 1m data found for {symbol}, initializing empty buffer")
                 self.candle_buffers[symbol] = {}
                 for timeframe in self.timeframes[1:]:
-                    self.candle_buffers[symbol][timeframe] = []
+                    self.candle_buffers[symbol][timeframe] = 0
                 return
             
             # Initialize buffer for each timeframe
@@ -485,7 +484,7 @@ class SchwabStreamerClient:
                     
                     if symbol not in self.candle_buffers:
                         self.candle_buffers[symbol] = {}
-                    self.candle_buffers[symbol][timeframe] = buffer_candles
+                    self.candle_buffers[symbol][timeframe] = len(df_1m) % timeframe_minutes
                     
                     if self.debug:
                         print(f"📊 {symbol} {timeframe}: {incomplete_count} incomplete candles in buffer")
@@ -493,7 +492,7 @@ class SchwabStreamerClient:
                     # No incomplete candles
                     if symbol not in self.candle_buffers:
                         self.candle_buffers[symbol] = {}
-                    self.candle_buffers[symbol][timeframe] = []
+                    self.candle_buffers[symbol][timeframe] = 0
                     
                     if self.debug:
                         print(f"📊 {symbol} {timeframe}: no incomplete candles")
@@ -505,9 +504,9 @@ class SchwabStreamerClient:
             if symbol not in self.candle_buffers:
                 self.candle_buffers[symbol] = {}
             for timeframe in self.timeframes[1:]:
-                self.candle_buffers[symbol][timeframe] = []
+                self.candle_buffers[symbol][timeframe] = 0
 
-    def add_to_candle_buffer(self, symbol: str, candle_data: dict):
+    def add_to_candle_buffer(self, symbol: str, timeframe: str):
         """
         Add new candle to buffer and check if aggregation is needed.
         """
@@ -518,21 +517,21 @@ class SchwabStreamerClient:
         # Add to all timeframe buffers
         for timeframe in self.timeframes[1:]:
             if timeframe not in self.candle_buffers[symbol]:
-                self.candle_buffers[symbol][timeframe] = []
+                self.candle_buffers[symbol][timeframe] = 0
             
             buffer = self.candle_buffers[symbol][timeframe]
-            buffer.append(candle_data)
+            buffer += 1
             
             # Check if we should aggregate
             timeframe_minutes = int(timeframe.replace('m', ''))
-            if len(buffer) == timeframe_minutes:
+            if buffer == timeframe_minutes:
                 # Buffer is full - aggregate and clear
                 aggregated_candle = self.aggregate_candles(symbol, timeframe)
                 if aggregated_candle:
                     self.process_new_candle(symbol, timeframe, aggregated_candle)
                 
                 # Clear buffer after aggregation
-                self.candle_buffers[symbol][timeframe] = []
+                self.candle_buffers[symbol][timeframe] = 0
                 
                 if self.debug:
                     print(f"✅ Aggregated {timeframe} candle for {symbol}, buffer cleared")
