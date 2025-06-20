@@ -87,10 +87,11 @@ FEATURES:
 """
 
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List
-import os
 import pytz
+from typing import Optional, List, Dict, Tuple
+import os
 from email_manager.email_manager import EmailManager
 
 
@@ -157,8 +158,33 @@ class Trade:
         """Create trade from dictionary (for CSV loading)"""
         et_tz = pytz.timezone('US/Eastern')
         
-        # Parse entry time
-        entry_time = datetime.strptime(data['entry_time'], '%Y-%m-%d %H:%M:%S %Z')
+        # Parse entry time with better error handling
+        entry_time_str = str(data['entry_time']).strip()  # Remove trailing spaces
+        entry_time = None
+        
+        # Try different timestamp formats
+        timestamp_formats = [
+            '%Y-%m-%d %H:%M:%S %Z',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M:%S EST',
+            '%Y-%m-%d %H:%M:%S EDT'
+        ]
+        
+        for fmt in timestamp_formats:
+            try:
+                entry_time = datetime.strptime(entry_time_str, fmt)
+                break
+            except ValueError:
+                continue
+                
+        if entry_time is None:
+            # Fallback: try to parse without timezone and add EST
+            try:
+                entry_time = datetime.strptime(entry_time_str.split(' ')[0] + ' ' + entry_time_str.split(' ')[1], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                raise ValueError(f"Unable to parse entry_time: '{entry_time_str}'")
+        
+        # Ensure timezone is set
         if not entry_time.tzinfo:
             entry_time = et_tz.localize(entry_time)
             
@@ -166,21 +192,41 @@ class Trade:
         trade = cls(data['symbol'], data['timeframe'], entry_time, data['entry_price'])
         
         # Set other attributes if trade is closed
-        if not data['is_open'] and data['exit_time']:
-            exit_time = datetime.strptime(data['exit_time'], '%Y-%m-%d %H:%M:%S %Z')
-            if not exit_time.tzinfo:
-                exit_time = et_tz.localize(exit_time)
-            trade.close_trade(exit_time, data['exit_price'])
-        
-        trade.pnl = data['pnl']
-        trade.pnl_percent = data['pnl_percent']
-        trade.max_unrealized_gain = data['max_unrealized_gain']
-        trade.max_unrealized_loss = data['max_unrealized_loss']
-        
-        if data['trade_duration_seconds']:
-            trade.trade_duration = timedelta(seconds=data['trade_duration_seconds'])
+        if not data['is_open'] and data['exit_time'] and str(data['exit_time']).strip() != 'nan':
+            exit_time_str = str(data['exit_time']).strip()  # Remove trailing spaces
+            exit_time = None
             
-        trade.is_open = data['is_open']
+            # Try different timestamp formats for exit time
+            for fmt in timestamp_formats:
+                try:
+                    exit_time = datetime.strptime(exit_time_str, fmt)
+                    break
+                except ValueError:
+                    continue
+                    
+            if exit_time is None:
+                # Fallback: try to parse without timezone and add EST
+                try:
+                    exit_time = datetime.strptime(exit_time_str.split(' ')[0] + ' ' + exit_time_str.split(' ')[1], '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    print(f"⚠️  Unable to parse exit_time: '{exit_time_str}', skipping")
+                    exit_time = None
+            
+            if exit_time:
+                if not exit_time.tzinfo:
+                    exit_time = et_tz.localize(exit_time)
+                trade.close_trade(exit_time, data['exit_price'])
+        
+        # Set numeric attributes with safe conversion
+        trade.pnl = float(data.get('pnl', 0))
+        trade.pnl_percent = float(data.get('pnl_percent', 0))
+        trade.max_unrealized_gain = float(data.get('max_unrealized_gain', 0))
+        trade.max_unrealized_loss = float(data.get('max_unrealized_loss', 0))
+        
+        if data.get('trade_duration_seconds') and str(data['trade_duration_seconds']).strip() != 'nan':
+            trade.trade_duration = timedelta(seconds=float(data['trade_duration_seconds']))
+            
+        trade.is_open = bool(data.get('is_open', True))
         
         return trade
 
@@ -473,10 +519,9 @@ class SignalProcessor:
                     self.all_trades.append(trade)
                     if save_to_csv:
                         self._save_new_trade(trade)  # Efficiently save new trade
-                    print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
-                    
-                    # Only send email for real-time signals, not historical
+                    # Only print and send email for real-time signals, not historical
                     if not is_historical:
+                        print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
                         self._send_buy_email(trade)  # Send buy email notification
                     return trade
                     
@@ -489,10 +534,9 @@ class SignalProcessor:
                     del self.open_trades[key]
                     if save_to_csv:
                         self._update_trade_in_csv(trade)  # Update existing trade
-                    print(f"🔴 SELL: Closed trade for {symbol} {timeframe} at {current_price:.2f}, P&L: {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
-                    
-                    # Only send email for real-time signals, not historical
+                    # Only print and send email for real-time signals, not historical
                     if not is_historical:
+                        print(f"🔴 SELL: Closed trade for {symbol} {timeframe} at {current_price:.2f}, P&L: {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
                         self._send_sell_email(trade)  # Send sell email notification
                 else:
                     # Update unrealized P&L and max gain/loss for every row
@@ -573,6 +617,7 @@ class SignalProcessor:
                 'open_trades': 0,
                 'closed_trades': 0,
                 'total_pnl': 0.0,
+                'avg_pnl': 0.0,
                 'winning_trades': 0,
                 'losing_trades': 0,
                 'win_rate': 0.0
@@ -582,6 +627,7 @@ class SignalProcessor:
         open_trades = [t for t in self.all_trades if t.is_open]
         
         total_pnl = sum(t.pnl for t in closed_trades)
+        avg_pnl = total_pnl / len(closed_trades) if closed_trades else 0.0
         winning_trades = len([t for t in closed_trades if t.pnl > 0])
         losing_trades = len([t for t in closed_trades if t.pnl < 0])
         win_rate = (winning_trades / len(closed_trades) * 100) if closed_trades else 0
@@ -591,6 +637,7 @@ class SignalProcessor:
             'open_trades': len(open_trades),
             'closed_trades': len(closed_trades),
             'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
             'winning_trades': winning_trades,
             'losing_trades': losing_trades,
             'win_rate': win_rate
@@ -629,6 +676,7 @@ class SignalProcessor:
                 'losing_trades': 0,
                 'win_rate': 0.0,
                 'total_pnl': 0.0,
+                'avg_pnl': 0.0,
                 'avg_win': 0.0,
                 'avg_loss': 0.0,
                 'max_win': 0.0,
@@ -647,6 +695,7 @@ class SignalProcessor:
         win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
         
         total_pnl = sum(trade.pnl for trade in closed_trades)
+        avg_pnl = total_pnl / total_trades if total_trades > 0 else 0.0
         
         wins = [t.pnl for t in closed_trades if t.pnl > 0]
         losses = [t.pnl for t in closed_trades if t.pnl <= 0]
@@ -672,6 +721,7 @@ class SignalProcessor:
             'losing_trades': losing_trades,
             'win_rate': win_rate,
             'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
             'avg_win': avg_win,
             'avg_loss': avg_loss,
             'max_win': max_win,
@@ -705,7 +755,7 @@ class SignalProcessor:
             
             # Create subject
             if subject:
-                pnl_emoji = "📈" if summary['total_pnl'] >= 0 else "📉"
+                pnl_emoji = "📈" if summary['avg_pnl'] >= 0 else "📉"
                 subject = f"{pnl_emoji} Trade Summary - {summary['closed_trades']} Closed, {summary['open_trades']} Open"
             
             # Build email body
@@ -715,7 +765,7 @@ class SignalProcessor:
 - Total Trades: {summary['total_trades']}
 - Closed Trades: {summary['closed_trades']}
 - Open Trades: {summary['open_trades']}
-- Total P&L: ${summary['total_pnl']:.2f}
+- Average P&L: ${summary['avg_pnl']:.2f}
 - Win Rate: {summary['win_rate']:.1f}%
 - Winning Trades: {summary['winning_trades']}
 - Losing Trades: {summary['losing_trades']}
@@ -727,8 +777,16 @@ class SignalProcessor:
                 body += "📋 Closed Trades Breakdown:\n"
                 closed_trades = [t for t in self.all_trades if not t.is_open]
                 
-                # Sort by exit time (most recent first)
-                closed_trades.sort(key=lambda x: x.exit_time if x.exit_time else datetime.min, reverse=True)
+                # Sort by exit time (most recent first) with timezone handling
+                et_tz = pytz.timezone('US/Eastern')
+                def get_exit_time_for_sorting(trade):
+                    exit_time = trade.exit_time if trade.exit_time else datetime.min.replace(tzinfo=et_tz)
+                    if exit_time.tzinfo is None:
+                        # If timezone-naive, assume Eastern Time
+                        exit_time = et_tz.localize(exit_time)
+                    return exit_time
+                
+                closed_trades.sort(key=get_exit_time_for_sorting, reverse=True)
                 
                 # Show last 10 closed trades
                 for i, trade in enumerate(closed_trades[:10], 1):
@@ -933,6 +991,7 @@ class SignalProcessor:
 
 💰 PROFIT & LOSS:
 • Total P&L: ${summary['total_pnl']:.2f}
+• Average P&L: ${summary['avg_pnl']:.2f}
 • Average Win: ${summary['avg_win']:.2f}
 • Average Loss: ${summary['avg_loss']:.2f}
 • Best Trade: ${summary['max_win']:.2f}
@@ -965,8 +1024,16 @@ class SignalProcessor:
                 symbol_trades = [trade for trade in all_trades 
                                if trade.symbol == symbol and trade.timeframe == timeframe]
                 
-                # Sort by entry time
-                symbol_trades.sort(key=lambda x: x.entry_time)
+                # Sort by entry time (ensure timezone consistency)
+                et_tz = pytz.timezone('US/Eastern')
+                def get_entry_time_for_sorting(trade):
+                    entry_time = trade.entry_time
+                    if entry_time.tzinfo is None:
+                        # If timezone-naive, assume Eastern Time
+                        entry_time = et_tz.localize(entry_time)
+                    return entry_time
+                
+                symbol_trades.sort(key=get_entry_time_for_sorting)
                 
                 for i, trade in enumerate(symbol_trades[-10:], 1):  # Show last 10 trades
                     status = "🔄 OPEN" if trade.is_open else "✅ CLOSED"
@@ -991,7 +1058,7 @@ class SignalProcessor:
             
             # Send email
             email_manager = EmailManager()
-            success = email_manager.send_email(subject, body)
+            success = email_manager._send_email(subject, body)
             
             if success:
                 print(f"✅ Trade summary email sent for {symbol} {timeframe}")
@@ -1003,6 +1070,21 @@ class SignalProcessor:
         except Exception as e:
             print(f"❌ Failed to send trade summary email for {symbol} {timeframe}: {str(e)}")
             return False
+
+    def has_processed_signals(self, symbol: str, timeframe: str) -> bool:
+        """
+        Check if signals have already been processed for this symbol-timeframe combination.
+        
+        Args:
+            symbol: Trading symbol
+            timeframe: Timeframe
+            
+        Returns:
+            bool: True if signals have been processed (trades exist), False otherwise
+        """
+        symbol = symbol.upper()
+        return any(trade.symbol == symbol and trade.timeframe == timeframe 
+                  for trade in self.all_trades)
 
 
 if __name__ == "__main__":
