@@ -17,6 +17,7 @@ from data_manager import DataManager
 import pandas as pd
 import os
 import time
+from options_manager import OptionsManager
 
 class SchwabStreamerClient:
     """Main client for Schwab Streaming API - OHLCV Data Collection"""
@@ -31,10 +32,11 @@ class SchwabStreamerClient:
         self.message_handlers = {}
         self.streamer_info = None  # Store streamer info for subscription requests
         
-        
-        # Initialize the new modules
         self.data_manager = DataManager()
         self.auth = self.data_manager.schwab_auth
+        # Initialize the new modules
+        self.options_manager = OptionsManager(self.auth)
+
         self.tracked_symbols = self.data_manager.symbols
         self.timeframes = self.data_manager.timeframes
 
@@ -71,6 +73,13 @@ class SchwabStreamerClient:
             7: 'time',       # Chart Time - Milliseconds since Epoch
             8: 'chart_day'   # Chart Day
         }
+        
+        # Example: fetch option symbols to track (calls+puts for all tracked symbols, 7 DTE)
+        self.option_symbols_to_track = ["SPY", "QQQ"]
+        option_symbols_dict = self.options_manager.get_option_symbols_for_multiple_symbols(self.option_symbols_to_track, days_to_expiration=0)
+        for symbol, d in option_symbols_dict.items():
+            self.option_symbols_to_track.extend(d['calls'])
+            self.option_symbols_to_track.extend(d['puts'])
     
     def get_user_preferences(self):
         """Get user preferences using the SchwabAuth token"""
@@ -177,6 +186,7 @@ class SchwabStreamerClient:
                             # Subscribe to symbols after successful login
                             print("📊 Subscribing to symbols...")
                             self.subscribe_chart_data(self.tracked_symbols)
+                            self.subscribe_option_data()  # Subscribe to option data
                         else:
                             print(f"❌ WebSocket login failed with code: {code}")
                             print(f"   Message: {content.get('msg', 'Unknown error')}")
@@ -229,86 +239,12 @@ class SchwabStreamerClient:
                         
                         elif service == "LEVELONE_OPTIONS" and content:
                             for content_item in content:
-                                print(f"\n🔍 PROCESSING LEVELONE_OPTIONS CONTENT:")
-                                print(f"   📄 Raw JSON: {json.dumps(content_item, indent=4)}")
-                                
-                                # Show detailed field breakdown
-                                print(f"   🗂️  Field Breakdown:")
-                                option_fields = {
-                                    'key': 'Option Symbol',
-                                    '0': 'symbol',
-                                    '1': 'description', 
-                                    '2': 'bid_price',
-                                    '3': 'ask_price',
-                                    '4': 'last_price',
-                                    '5': 'high_price',
-                                    '6': 'low_price',
-                                    '7': 'close_price',
-                                    '8': 'total_volume',
-                                    '9': 'open_interest',
-                                    '10': 'volatility',
-                                    '11': 'intrinsic_value',
-                                    '12': 'expiration_year',
-                                    '13': 'multiplier',
-                                    '14': 'digits',
-                                    '15': 'open_price',
-                                    '16': 'bid_size',
-                                    '17': 'ask_size',
-                                    '18': 'last_size',
-                                    '19': 'net_change',
-                                    '20': 'strike_price',
-                                    '21': 'contract_type',
-                                    '22': 'underlying',
-                                    '23': 'expiration_month',
-                                    '24': 'deliverables',
-                                    '25': 'time_value',
-                                    '26': 'expiration_day',
-                                    '27': 'days_to_expiration',
-                                    '28': 'delta',
-                                    '29': 'gamma',
-                                    '30': 'theta',
-                                    '31': 'vega',
-                                    '32': 'rho',
-                                    '33': 'security_status',
-                                    '34': 'theoretical_value',
-                                    '35': 'underlying_price',
-                                    '36': 'uv_expiration_type',
-                                    '37': 'mark_price',
-                                    '38': 'quote_time',
-                                    '39': 'trade_time',
-                                    '40': 'exchange',
-                                    '41': 'exchange_name',
-                                    '42': 'last_trading_day',
-                                    '43': 'settlement_type',
-                                    '44': 'net_percent_change',
-                                    '45': 'mark_price_net_change',
-                                    '46': 'mark_price_percent_change',
-                                    '47': 'implied_yield',
-                                    '48': 'is_penny_pilot',
-                                    '49': 'option_root',
-                                    '50': 'week_52_high',
-                                    '51': 'week_52_low',
-                                    '52': 'indicative_ask_price',
-                                    '53': 'indicative_bid_price',
-                                    '54': 'indicative_quote_time',
-                                    '55': 'exercise_type'
-                                }
-                                
-                                for field_id, value in content_item.items():
-                                    field_name = option_fields.get(field_id, f'unknown_field_{field_id}')
-                                    print(f"      {field_id:>3} ({field_name:<20}): {value}")
-                                
-                                # Highlight key pricing fields
-                                key_fields = ['key', '2', '3', '4', '20', '22', '35', '37']  # Symbol, Bid, Ask, Last, Strike, Underlying, Underlying Price, Mark
-                                print(f"   🎯 Key Fields:")
-                                for field_id in key_fields:
-                                    if field_id in content_item:
-                                        field_name = option_fields.get(field_id, field_id)
-                                        value = content_item[field_id]
-                                        print(f"      {field_name}: {value}")
-                                
-                                # Note: This section is for options processing, not chart equity
-                        
+                                option_symbol = content_item.get('key')
+                                print(f"[DEBUG] Incoming option data for symbol: {option_symbol}")
+                                print(f"[DEBUG] Option data keys: {list(content_item.keys())}")
+                                if option_symbol:
+                                    self.options_manager.save_option_data_to_csv(option_symbol, content_item)
+                                    print(f"💾 Saved data for {option_symbol}")
         except Exception as e:
             print(f"❌ Message handling error: {str(e)}")
             print(f"   Raw message: {message}")
@@ -459,6 +395,38 @@ class SchwabStreamerClient:
             print(f"❌ Error subscribing to CHART_EQUITY data: {e}")
             raise
 
+    def subscribe_option_data(self):
+        """Subscribe to LEVELONE_OPTIONS data for the option symbols to track"""
+        if not self.connected:
+            print("❌ Not connected to WebSocket")
+            return
+        if not self.option_symbols_to_track:
+            print("⚠️  No option symbols to track.")
+            return
+        print(f"[DEBUG] Subscribing to {len(self.option_symbols_to_track)} option symbols:")
+        for sym in self.option_symbols_to_track:
+            print(f"  {sym}")
+        try:
+            request = {
+                "service": "LEVELONE_OPTIONS",
+                "command": "SUBS",
+                "requestid": self.request_id,
+                "SchwabClientCustomerId": self.schwab_client_customer_id,
+                "SchwabClientCorrelId": f"options_{int(time.time() * 1000)}",
+                "parameters": {
+                    "keys": ",".join(self.option_symbols_to_track),
+                    "fields": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55"
+                }
+            }
+            if self.debug:
+                print(f"📤 Sending LEVELONE_OPTIONS subscription request: {json.dumps(request, indent=2)}")
+            self.ws.send(json.dumps(request))
+            self.request_id += 1
+            print(f"✅ Subscribed to LEVELONE_OPTIONS data for {len(self.option_symbols_to_track)} options.")
+        except Exception as e:
+            print(f"❌ Error subscribing to LEVELONE_OPTIONS data: {e}")
+            raise
+
     def disconnect(self):
         """Disconnect from WebSocket API"""
         self.running = False
@@ -528,7 +496,7 @@ class SchwabStreamerClient:
             try:
                 # Get bootstrap parameters for the timeframe
                 bootstrap_params = self.data_manager.get_bootstrap_parameters()
-                
+            
                 if self.debug:
                     print(f"📊 Using bootstrap parameters for {symbol} {timeframe}:")
                     print(f"   EMA: {bootstrap_params['ema_period'].get(timeframe, 5)}")
@@ -552,8 +520,8 @@ class SchwabStreamerClient:
                 )
                 
                 # Save updated indicator states
-                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe)
-                
+                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe, df_with_indicators)
+            
             except Exception as e:
                 print(f"⚠️  Error generating indicators for {symbol} {timeframe}: {e}")
                 df_with_indicators = df
@@ -848,7 +816,7 @@ class SchwabStreamerClient:
                 )
                 
                 # Save updated indicator states
-                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe)
+                self.data_manager.indicator_generator.save_indicator_states(symbol, timeframe, df_with_indicators)
                 
             except Exception as e:
                 print(f"⚠️  Error generating indicators for {symbol} {timeframe}: {e}")
@@ -909,7 +877,7 @@ if __name__ == "__main__":
         
         # Keep the script running
         while True:
-            time.sleep(1)  
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
         client.disconnect()

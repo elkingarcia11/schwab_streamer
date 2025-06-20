@@ -295,6 +295,10 @@ class SignalProcessor:
             trade_data = [trade.to_dict() for trade in self.all_trades]
             df = pd.DataFrame(trade_data)
             
+            # Sort by is_open (open trades first), then by entry_time descending
+            if 'is_open' in df.columns:
+                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
+                
             # Save to CSV
             df.to_csv(self.trades_csv_path, index=False)
             print(f"💾 Saved {len(df)} trades to {self.trades_csv_path}")
@@ -362,6 +366,10 @@ class SignalProcessor:
             trade_data = [trade.to_dict() for trade in trades]
             df = pd.DataFrame(trade_data)
             
+            # Sort by is_open (open trades first), then by entry_time descending
+            if 'is_open' in df.columns:
+                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
+                
             # Save to CSV
             df.to_csv(self.trades_csv_path, index=False)
             print(f"💾 Saved {len(df)} trades to {self.trades_csv_path}")
@@ -935,7 +943,7 @@ class SignalProcessor:
             df = pd.read_csv(self.trades_csv_path)
             
             # Update each open trade in the CSV
-            for trade in self.open_trades.values():
+            for trade in list(self.open_trades.values()):
                 mask = (
                     (df['symbol'] == trade.symbol) & 
                     (df['timeframe'] == trade.timeframe) & 
@@ -948,6 +956,10 @@ class SignalProcessor:
                     for key, value in trade_dict.items():
                         df.loc[mask, key] = value
             
+            # Sort by is_open (open trades first), then by entry_time descending
+            if 'is_open' in df.columns:
+                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
+                
             # Save updated DataFrame
             df.to_csv(self.trades_csv_path, index=False)
             print(f"💾 Updated {len(self.open_trades)} open trades with max unrealized values")

@@ -1,6 +1,6 @@
 from schwab_streamer_client import SchwabStreamerClient
 import time
-from options import OptionsManager
+from options_manager import OptionsManager
 
 def stream_spy():
     """

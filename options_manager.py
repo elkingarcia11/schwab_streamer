@@ -1,17 +1,13 @@
 from schwab_auth import SchwabAuth
-from schwab_streamer_client import SchwabStreamerClient
 import httpx
 from typing import Optional, Dict, List
-import time
 import os
 import csv
 from datetime import datetime
-import json
 
 class OptionsManager:
-    def __init__(self):
-        self.auth = SchwabAuth()
-        self.streamer_client = None
+    def __init__(self, auth: Optional[SchwabAuth] = None):
+        self.auth = auth or SchwabAuth()
         self.csv_writers = {}  # Store CSV writers for each option symbol
         self.csv_files = {}    # Store file handles for each option symbol
         
@@ -41,6 +37,7 @@ class OptionsManager:
         Args:
             option_symbol (str): The option symbol
         """
+        self.ensure_options_data_directory()  # Ensure directory exists before writing
         try:
             filename = self.get_csv_filename(option_symbol)
             
@@ -75,62 +72,59 @@ class OptionsManager:
             
     def save_option_data_to_csv(self, option_symbol: str, data: dict):
         """
-        Save option data to CSV file.
-        
-        Args:
-            option_symbol (str): The option symbol
-            data (dict): The option data to save
+        Save option data to CSV file, only for SPY and QQQ options, and map Schwab stream fields to the correct columns.
         """
+        # Only track SPY and QQQ options
+        if not (option_symbol.startswith('SPY') or option_symbol.startswith('QQQ')):
+            return
         try:
             if option_symbol not in self.csv_writers:
                 self.initialize_csv_writer(option_symbol)
-                
             writer = self.csv_writers[option_symbol]
-            
-            # Prepare row data
+            # Map Schwab stream fields to your desired columns
             row = [
-                datetime.now().isoformat(),  # timestamp
-                data.get('symbol', ''),
-                data.get('bid', ''),
-                data.get('ask', ''),
-                data.get('last', ''),
-                data.get('mark', ''),
-                data.get('bidSize', ''),
-                data.get('askSize', ''),
-                data.get('lastSize', ''),
-                data.get('highPrice', ''),
-                data.get('lowPrice', ''),
-                data.get('openPrice', ''),
-                data.get('closePrice', ''),
-                data.get('totalVolume', ''),
-                data.get('tradeTimeInLong', ''),
-                data.get('quoteTimeInLong', ''),
-                data.get('netChange', ''),
-                data.get('volatility', ''),
-                data.get('delta', ''),
-                data.get('gamma', ''),
-                data.get('theta', ''),
-                data.get('vega', ''),
-                data.get('rho', ''),
-                data.get('openInterest', ''),
-                data.get('timeValue', ''),
-                data.get('theoreticalOptionValue', ''),
-                data.get('theoreticalVolatility', ''),
-                data.get('strikePrice', ''),
-                data.get('expirationDate', ''),
-                data.get('daysToExpiration', ''),
-                data.get('multiplier', ''),
-                data.get('percentChange', ''),
-                data.get('markChange', ''),
-                data.get('markPercentChange', ''),
-                data.get('intrinsicValue', ''),
-                data.get('extrinsicValue', ''),
-                data.get('inTheMoney', ''),
-                data.get('pennyPilot', '')
+                datetime.now().isoformat(),
+                data.get('underlying', ''),  # symbol
+                data.get('2', ''),  # bid
+                data.get('3', ''),  # ask
+                data.get('4', ''),  # last
+                data.get('37', ''), # mark
+                data.get('16', ''), # bidSize
+                data.get('17', ''), # askSize
+                data.get('18', ''), # lastSize
+                data.get('5', ''),  # highPrice
+                data.get('6', ''),  # lowPrice
+                data.get('15', ''), # openPrice
+                data.get('7', ''),  # closePrice
+                data.get('8', ''),  # totalVolume
+                data.get('39', ''), # tradeTime
+                data.get('38', ''), # quoteTime
+                data.get('19', ''), # netChange
+                data.get('10', ''), # volatility
+                data.get('28', ''), # delta
+                data.get('29', ''), # gamma
+                data.get('30', ''), # theta
+                data.get('31', ''), # vega
+                data.get('32', ''), # rho
+                data.get('9', ''),  # openInterest
+                data.get('25', ''), # timeValue
+                data.get('34', ''), # theoreticalOptionValue
+                data.get('35', ''), # theoreticalVolatility
+                data.get('20', ''), # strikePrice
+                data.get('12', ''), # expirationDate (may need formatting)
+                data.get('27', ''), # daysToExpiration
+                data.get('13', ''), # multiplier
+                data.get('44', ''), # percentChange
+                data.get('45', ''), # markChange
+                data.get('46', ''), # markPercentChange
+                data.get('11', ''), # intrinsicValue
+                data.get('25', ''), # extrinsicValue (may need calculation)
+                data.get('33', ''), # inTheMoney
+                data.get('48', ''), # pennyPilot
             ]
-            
             writer.writerow(row)
-            
+            # Ensure data is written to disk immediately
+            self.csv_files[option_symbol].flush()
         except Exception as e:
             print(f"❌ Error saving data to CSV for {option_symbol}: {e}")
             
@@ -146,29 +140,6 @@ class OptionsManager:
         self.csv_files.clear()
         self.csv_writers.clear()
         
-    def on_option_message(self, message_data: dict):
-        """
-        Handle incoming option messages and save to CSV.
-        
-        Args:
-            message_data (dict): The option message data
-        """
-        try:
-            # Extract option data from the message
-            if 'data' in message_data:
-                for data_item in message_data['data']:
-                    if data_item.get('service') == 'LEVELONE_OPTIONS':
-                        content = data_item.get('content', [])
-                        for option_data in content:
-                            if isinstance(option_data, dict):
-                                symbol = option_data.get('symbol', '')
-                                if symbol:
-                                    # Save to CSV
-                                    self.save_option_data_to_csv(symbol, option_data)
-                                    print(f"💾 Saved data for {symbol}")
-                                    
-        except Exception as e:
-            print(f"❌ Error handling option message: {e}")
 
     def get_expiration_chain(self, symbol: str) -> List[Dict]:
         """
@@ -615,39 +586,12 @@ class OptionsManager:
                 print(f"📊 {symbol}: {len(calls)} calls + {len(puts)} puts = {len(calls) + len(puts)} total options")
             
             print(f"📋 Total option symbols to stream: {len(all_option_symbols_flat)}")
-            
-            # Initialize streaming client
-            self.streamer_client = SchwabStreamerClient(debug=debug)
-            
-            # Set all option symbols as tracked symbols
-            self.streamer_client.tracked_symbols = all_option_symbols_flat
-            
-            # Initialize CSV writers for all option symbols
-            for option_symbol in all_option_symbols_flat:
-                self.initialize_csv_writer(option_symbol)
-            
-            print(f"🔗 Connecting to streaming service for {len(all_option_symbols_flat)} option symbols...")
-            
-            # Connect and start streaming
-            self.streamer_client.connect()
-            
-            # Keep the script running
-            print("📈 Streaming option data for multiple symbols. Press Ctrl+C to stop.")
-            while True:
-                time.sleep(1)
-                
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping multi-symbol option stream...")
+            return all_option_symbols_flat
         except Exception as e:
-            print(f"❌ Error in multi-symbol option streaming: {e}")
-        finally:
-            # Clean up
-            self.close_csv_files()
-            if self.streamer_client:
-                self.streamer_client.disconnect()
-                print("🔌 Disconnected from streaming service")
+            print(f"❌ Error during option streaming: {e}")
+            return []
 
-    def stream_options(self, symbol: str, days_to_expiration: int, debug: bool = True):
+    def stream_options(self, symbols: list[str], days_to_expiration: int, debug: bool = True):
         """
         Stream option data for a single symbol and days to expiration using LEVELONE_OPTIONS service.
         
@@ -657,25 +601,4 @@ class OptionsManager:
             debug (bool): Whether to enable debug mode for streaming
         """
         # Use the multi-symbol function with a single symbol
-        self.stream_multiple_symbols_options([symbol], days_to_expiration, debug)
-
-if __name__ == "__main__":
-    # Example usage with multiple symbols
-    symbols = ["SPY", "QQQ"]  # Add more symbols as needed
-    days = 5
-    
-    options_manager = OptionsManager()
-    
-    # Option 1: Stream multiple symbols
-    print("🚀 Starting multi-symbol option streaming...")
-    options_manager.stream_multiple_symbols_options(symbols, days)
-    
-    # Option 2: Stream single symbol (still works)
-    # options_manager.stream_options("SPY", days)
-    
-    # Option 3: Get option symbols without streaming
-    # all_option_symbols = options_manager.get_option_symbols_for_multiple_symbols(symbols, days)
-    # for symbol, option_data in all_option_symbols.items():
-    #     print(f"\n{symbol} options:")
-    #     print(f"Calls: {option_data['calls']}")
-    #     print(f"Puts: {option_data['puts']}") 
+        self.stream_multiple_symbols_options(symbols, days_to_expiration, debug)

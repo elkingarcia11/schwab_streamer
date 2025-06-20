@@ -13,6 +13,8 @@ Key Features:
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import os
+from typing import Optional
 
 class IndicatorGenerator:
     """
@@ -505,74 +507,74 @@ class IndicatorGenerator:
             'macd_signal_ema': None
         }
 
-if __name__ == "__main__":
-    import pandas as pd
-    from datetime import datetime, timedelta
+    def load_indicator_states(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """
+        Loads indicator state from data/{timeframe}/{symbol}.csv if it exists.
+        Returns a pandas DataFrame or None if the file does not exist.
+        """
+        file_path = os.path.join('data', timeframe, f'{symbol}.csv')
+        if os.path.exists(file_path):
+            try:
+                df = pd.read_csv(file_path)
+                return df
+            except Exception as e:
+                print(f"Error loading indicator state for {symbol} {timeframe}: {e}")
+                return None
+        return None
 
-    # Create sample original data (historical)
-    base_time = datetime(2025, 1, 20, 9, 30, 0)
-    original_data = pd.DataFrame({
-        'time': [base_time + timedelta(minutes=i) for i in range(100)],
-        'open': [100.0 + i * 0.01 for i in range(100)],
-        'high': [100.8 + i * 0.01 for i in range(100)],
-        'low': [99.8 + i * 0.01 for i in range(100)],
-        'close': [100.5 + i * 0.01 for i in range(100)],
-        'volume': [1000 + i * 10 for i in range(100)]
-    })
+    def save_indicator_states(self, symbol: str, timeframe: str, df: pd.DataFrame):
+        """
+        Saves indicator state to data/{timeframe}/{symbol}.csv.
+        """
+        dir_path = os.path.join('data', timeframe)
+        os.makedirs(dir_path, exist_ok=True)
+        file_path = os.path.join(dir_path, f'{symbol}.csv')
+        try:
+            df.to_csv(file_path, index=False)
+        except Exception as e:
+            print(f"Error saving indicator state for {symbol} {timeframe}: {e}")
 
-    # Create sample additional data (new data to append)
-    additional_data = pd.DataFrame({
-        'time': [base_time + timedelta(minutes=100 + i) for i in range(10)],
-        'open': [101.0 + i * 0.01 for i in range(10)],
-        'high': [101.8 + i * 0.01 for i in range(10)],
-        'low': [100.8 + i * 0.01 for i in range(10)],
-        'close': [101.5 + i * 0.01 for i in range(10)],
-        'volume': [2000 + i * 10 for i in range(10)]
-    })
-
-    # Initialize indicator generator
-    indicator_gen = IndicatorGenerator()
-
-    # Define indicator parameters
-    ema_period = 7
-    vwma_period = 17
-    roc_period = 8
-    fast_ema = 12
-    slow_ema = 26
-    signal_ema = 9
-
-    print("\n=== CASE 1: Initial bulk calculation (no additional_df) ===")
-    print("Processing original data with bulk calculation...")
-    result1 = indicator_gen.smart_indicator_calculation(
-        "SPY", "5m",
-        original_df=original_data,  # Process this data
-        additional_df=None,         # No additional data
-        ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
-        fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema
-    )
-    print(f"✅ Result: {len(result1)} rows with indicators")
-    print("Last row indicators:")
-    print(f"  EMA_{ema_period}: {result1[f'ema_{ema_period}'].iloc[-1]:.4f}")
-    print(f"  VWMA_{vwma_period}: {result1[f'vwma_{vwma_period}'].iloc[-1]:.4f}")
-    print(f"  ROC_{roc_period}: {result1[f'roc_{roc_period}'].iloc[-1]:.4f}")
-
-    print("\n=== CASE 2: Incremental calculation (with additional_df) ===")
-    print("Processing additional data incrementally, assuming original_df already has indicators...")
-    result2 = indicator_gen.smart_indicator_calculation(
-        "SPY", "5m",
-        original_df=result1,        # Original data with existing indicators
-        additional_df=additional_data,  # New data to process
-        ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
-        fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema
-    )
-    print(f"✅ Result: {len(result2)} rows (original + additional with indicators)")
-    print("Last row indicators (from additional data):")
-    print(f"  EMA_{ema_period}: {result2[f'ema_{ema_period}'].iloc[-1]:.4f}")
-    print(f"  VWMA_{vwma_period}: {result2[f'vwma_{vwma_period}'].iloc[-1]:.4f}")
-    print(f"  ROC_{roc_period}: {result2[f'roc_{roc_period}'].iloc[-1]:.4f}")
-
-    print("\n=== Summary ===")
-    print(f"Original data: {len(original_data)} rows")
-    print(f"Additional data: {len(additional_data)} rows")
-    print(f"Final result: {len(result2)} rows")
-    print("✅ Incremental calculation maintains state continuity!")
+    def generate_indicators_incremental(self, df, symbol, timeframe,
+                                        ema_period=None, vwma_period=None, roc_period=None,
+                                        fast_ema=None, slow_ema=None, signal_ema=None, states=None):
+        """
+        Incrementally calculate indicators for new data, using previous state loaded from CSV if available.
+        Ensures indicator continuity by always loading the last indicator row from CSV and initializing state.
+        """
+        # Always load previous state from CSV (not just if states is None)
+        prev_df = self.load_indicator_states(symbol, timeframe)
+        if prev_df is not None and not prev_df.empty:
+            # Use the last row of the CSV to initialize state for incremental calculation
+            self.load_state_from_dataframe(symbol, timeframe, prev_df,
+                                          ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
+                                          fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema)
+        
+        # If DataFrame is empty, nothing to do
+        if df is None or len(df) == 0:
+            return df
+        
+        key = f"{symbol}_{timeframe}"
+        last_ts = None
+        if prev_df is not None and 'timestamp' in prev_df.columns and len(prev_df) > 0:
+            last_ts = prev_df['timestamp'].iloc[-1]
+        if last_ts is not None:
+            # Only process new rows
+            new_rows = df[df['timestamp'] > last_ts]
+            if len(new_rows) == 0:
+                return df  # No new data
+            # Calculate indicators for new rows using the loaded state
+            new_rows_with_ind = self.calculate_real_time_indicators(
+                symbol, timeframe, new_rows,
+                ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
+                fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema
+            )
+            # Merge with old DataFrame (preserve all columns)
+            df = pd.concat([df[df['timestamp'] <= last_ts], new_rows_with_ind], ignore_index=True)
+        else:
+            # No previous timestamp, process all
+            df = self.generate_all_indicators(symbol, timeframe, df,
+                                              ema_period=ema_period, vwma_period=vwma_period, roc_period=roc_period,
+                                              fast_ema=fast_ema, slow_ema=slow_ema, signal_ema=signal_ema)
+        # Save updated state
+        self.save_indicator_states(symbol, timeframe, df)
+        return df

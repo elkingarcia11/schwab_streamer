@@ -244,16 +244,21 @@ class DataManager:
         try:
             # Check if file exists
             file_exists = os.path.exists(csv_filename)
-            
             # Convert row to DataFrame for to_csv compatibility
             row_df = row.to_frame().T
-            
+            # Prevent duplicate: check if last row in file has same timestamp
+            if file_exists:
+                try:
+                    last_row = pd.read_csv(csv_filename, nrows=1, skiprows=lambda x: x < sum(1 for _ in open(csv_filename)) - 1)
+                    if 'timestamp' in last_row.columns and row['timestamp'] == last_row['timestamp'].iloc[0]:
+                        print(f"⚠️  Duplicate row detected for {symbol} {timeframe} (timestamp={row['timestamp']}), skipping append.")
+                        return
+                except Exception as e:
+                    print(f"⚠️  Could not check for duplicate row in {csv_filename}: {e}")
             # Append to CSV (write header only if file doesn't exist)
             row_df.to_csv(csv_filename, mode='a', header=not file_exists, index=False)
-            
             if not file_exists:
                 print(f"📄 Created new CSV file: {csv_filename}")
-            
         except Exception as e:
             print(f"❌ Error appending to CSV {csv_filename}: {e}")
             # Fallback to full save if append fails
