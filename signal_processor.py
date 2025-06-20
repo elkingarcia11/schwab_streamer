@@ -502,8 +502,13 @@ class SignalProcessor:
             Optional[Trade]: New trade if opened, None otherwise
         """
         symbol = symbol.upper()
-        
         try:
+            # Debug: Entry point
+            print(f"\n🔍 [SignalProcessor] process_latest_signal called for {symbol} {timeframe}")
+            if 'close' in row:
+                print(f"   Close price: {row['close']}")
+            if 'datetime' in row:
+                print(f"   Datetime: {row['datetime']}")
             # Parse datetime
             if 'datetime' in row:
                 dt_str = row['datetime']
@@ -514,12 +519,23 @@ class SignalProcessor:
                     dt = self.et_tz.localize(dt)
             else:
                 dt = datetime.now(self.et_tz)
-                
             current_price = row['close']
             key = self._get_trade_key(symbol, timeframe)
-            
+            # Debug: Indicator values
+            try:
+                ema_col = [col for col in row.index if col.startswith('ema_')]
+                vwma_col = [col for col in row.index if col.startswith('vwma_')]
+                roc_col = [col for col in row.index if col.startswith('roc_')]
+                macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
+                macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
+                if ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col:
+                    print(f"   EMA: {row[ema_col[0]]}, VWMA: {row[vwma_col[0]]}, ROC: {row[roc_col[0]]}, MACD Line: {row[macd_line_col[0]]}, MACD Signal: {row[macd_signal_col[0]]}")
+            except Exception as e:
+                print(f"   [Debug] Could not print indicator values: {e}")
             # Check for buy signal
-            if self._check_buy_signal(row):
+            buy_signal = self._check_buy_signal(row)
+            print(f"   [Debug] Buy signal check: {buy_signal}")
+            if buy_signal:
                 if key not in self.open_trades:
                     # Open new trade
                     trade = Trade(symbol, timeframe, dt, current_price)
@@ -532,11 +548,12 @@ class SignalProcessor:
                         print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
                         self._send_buy_email(trade)  # Send buy email notification
                     return trade
-                    
             # Check for sell signal on existing open trade
             if key in self.open_trades:
                 trade = self.open_trades[key]
-                if self._check_sell_signal(row, current_price, trade.entry_price):
+                sell_signal = self._check_sell_signal(row, current_price, trade.entry_price)
+                print(f"   [Debug] Sell signal check: {sell_signal}")
+                if sell_signal:
                     # Close trade
                     trade.close_trade(dt, current_price)
                     del self.open_trades[key]
@@ -549,13 +566,13 @@ class SignalProcessor:
                 else:
                     # Update unrealized P&L and max gain/loss for every row
                     trade.update_unrealized_pnl(current_price, dt)
-                    # Note: We don't save unrealized P&L updates to CSV to avoid excessive writes
-                    
+                    print(f"   [Debug] No sell signal. Updated unrealized P&L for open trade.")
+            else:
+                print(f"   [Debug] No open trade for {symbol} {timeframe}.")
             # Update max unrealized gain/loss for any existing open trade (even if no signals triggered)
             if key in self.open_trades:
                 trade = self.open_trades[key]
                 trade.update_unrealized_pnl(current_price, dt)
-            
             # Periodically save open trades to persist max unrealized gain/loss values
             # Only for real-time processing (not historical) to avoid excessive writes
             if not is_historical and self.open_trades:
@@ -563,10 +580,8 @@ class SignalProcessor:
                 if self.update_counter >= self.save_open_trades_interval:
                     self._save_open_trades_to_csv()
                     self.update_counter = 0  # Reset counter
-                    
         except Exception as e:
             print(f"❌ Error processing latest signal for {symbol} {timeframe}: {e}")
-            
         return None
         
     def process_historical_signals(self, symbol: str, timeframe: str, df: pd.DataFrame) -> List[Trade]:
