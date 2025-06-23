@@ -376,7 +376,7 @@ Happy trading! 📈📉
                 strategy_data = "Regular Data" if option_type == 'CALL' else "Inverse Data (1/OHLC)"
                 position_type = f"LONG {option_type}"
                 
-                body = f"""🚨 {action_text} {option_name.upper()} OPTIONS SIGNAL - {symbol} {timeframe}min
+                body = f"""🚨 {action_text} {option_name} OPTIONS SIGNAL - {symbol} {timeframe}min
 
 📊 Options Details:
 - Position Type: {position_type} ({strategy_data})

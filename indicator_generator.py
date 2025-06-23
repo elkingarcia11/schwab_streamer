@@ -8,26 +8,26 @@ class IndicatorGenerator:
     def __init__(self):
         # Store the last calculated indicator values for each symbol/timeframe combination
         self.last_values = {}
-        # Map symbol, timeframe to EMA, VWMA, ROC, FAST_EMA, SLOW_EMA, SIGNAL_EMA PERIODS
+        # Maptimeframe to EMA, VWMA, ROC, FAST_EMA, SLOW_EMA, SIGNAL_EMA PERIODS
         self.periods = {
-            'SPY': {
-                '1m': {'ema': 5, 'vwma': 16, 'roc': 6, 'fast_ema': 15, 'slow_ema': 39, 'signal_ema': 11},
-                '5m': {'ema': 7, 'vwma': 6, 'roc': 11, 'fast_ema': 21, 'slow_ema': 37, 'signal_ema': 15},
-                '10m': {'ema': 9, 'vwma': 5, 'roc': 10, 'fast_ema': 16, 'slow_ema': 31, 'signal_ema': 10},
-                '15m': {'ema': 6, 'vwma': 4, 'roc': 7, 'fast_ema': 14, 'slow_ema': 30, 'signal_ema': 10},
-                '30m': {'ema': 6, 'vwma': 2, 'roc': 5, 'fast_ema': 22, 'slow_ema': 39, 'signal_ema': 12},
-            }
+            '1m': {'ema': 5, 'vwma': 16, 'roc': 6, 'fast_ema': 15, 'slow_ema': 39, 'signal_ema': 11},
+            '5m': {'ema': 7, 'vwma': 6, 'roc': 11, 'fast_ema': 21, 'slow_ema': 37, 'signal_ema': 15},
+            '10m': {'ema': 9, 'vwma': 5, 'roc': 10, 'fast_ema': 16, 'slow_ema': 31, 'signal_ema': 10},
+            '15m': {'ema': 6, 'vwma': 4, 'roc': 7, 'fast_ema': 14, 'slow_ema': 30, 'signal_ema': 10},
+            '30m': {'ema': 6, 'vwma': 2, 'roc': 5, 'fast_ema': 22, 'slow_ema': 39, 'signal_ema': 12},
         }
+
     
     def initialize_indicators_state(self, symbol: str, timeframe: str, df: pd.DataFrame):
-        # if df not empty, load state from dataframe
-        if not df.empty:
-            self.load_state_from_dataframe(symbol, timeframe, df)
-        else:
+        # If DF exists, load state from it
+        if df is None or df.empty:
+            print(f"❌ No data available to initialize state for {symbol} {timeframe}")
             # Initialize state with default values
             self.last_values[(symbol, timeframe)] = self._initialize_empty_state()
+            return
+        self.load_state_from_dataframe(symbol, timeframe, df)
 
-    def generate_all_indicators(self, symbol: str, timeframe: str, df: pd.DataFram) -> pd.DataFrame:
+    def generate_all_indicators(self, symbol: str, timeframe: str, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process all indicators for a single symbol and timeframe using provided DataFrame.
         
@@ -246,23 +246,17 @@ class IndicatorGenerator:
             symbol (str): Symbol name
             timeframe (str): Timeframe (e.g., '5m', '10m')
             df (pd.DataFrame): DataFrame with existing data and indicators
-            ema_period (int): EMA period
-            vwma_period (int): VWMA period
-            roc_period (int): ROC period
-            fast_ema (int): Fast EMA for MACD
-            slow_ema (int): Slow EMA for MACD
-            signal_ema (int): Signal EMA for MACD
             
         Returns:
             bool: True if state was loaded successfully, False otherwise
         """
         try:
-            ema_period = self.periods[symbol][timeframe]['ema']
-            vwma_period = self.periods[symbol][timeframe]['vwma']
-            roc_period = self.periods[symbol][timeframe]['roc']
-            fast_ema = self.periods[symbol][timeframe]['fast_ema']
-            slow_ema = self.periods[symbol][timeframe]['slow_ema']
-            signal_ema = self.periods[symbol][timeframe]['signal_ema']
+            ema_period = self.periods[timeframe]['ema']
+            vwma_period = self.periods[timeframe]['vwma']
+            roc_period = self.periods[timeframe]['roc']
+            fast_ema = self.periods[timeframe]['fast_ema']
+            slow_ema = self.periods[timeframe]['slow_ema']
+            signal_ema = self.periods[timeframe]['signal_ema']
             if len(df) == 0:
                 return False
                 
@@ -285,12 +279,13 @@ class IndicatorGenerator:
             last_row = df.iloc[-1]
             
             # Load EMA value if it exists
-            if ema_period and f'ema_{ema_period}' in df.columns:
-                last_values['ema'] = last_row[f'ema_{ema_period}']
+            if ema_period and 'ema' in df.columns:
+                last_values['ema'] = last_row['ema']
                 print(f"📊 Loaded EMA_{ema_period} value: {last_values['ema']}")
-            
+            else:
+                print(f"📊 No EMA_{ema_period} value found")
             # Load VWMA buffer - need to reconstruct from last few rows
-            if vwma_period and f'vwma_{vwma_period}' in df.columns:
+            if vwma_period and 'vwma' in df.columns:
                 # Get last vwma_period rows to reconstruct buffer
                 last_n_rows = df.tail(vwma_period)
                 vwma_buffer = []
@@ -298,7 +293,8 @@ class IndicatorGenerator:
                     vwma_buffer.append((row['close'], row['volume']))
                 last_values['vwma_buffer'] = vwma_buffer
                 print(f"📊 Loaded VWMA_{vwma_period} buffer with {len(vwma_buffer)} points")
-            
+            else:
+                print(f"📊 No VWMA_{vwma_period} value found")
             # Load ROC buffer - need to reconstruct from last roc_period rows
             if roc_period:
                 # Get last roc_period rows to reconstruct buffer
@@ -308,7 +304,8 @@ class IndicatorGenerator:
                     roc_buffer.append(row['close'])
                 last_values['roc_buffer'] = roc_buffer
                 print(f"📊 Loaded ROC_{roc_period} buffer with {len(roc_buffer)} close prices")
-            
+            else:
+                print(f"📊 No ROC_{roc_period} value found")
             # Load last close price
             last_values['last_close'] = last_row['close']
             print(f"📊 Loaded last close price: {last_values['last_close']}")
@@ -323,7 +320,8 @@ class IndicatorGenerator:
                     last_values['macd_fast_ema'] = last_row['close']  # Approximation
                     last_values['macd_slow_ema'] = last_row['close']  # Approximation
                     print(f"📊 Loaded MACD signal value: {last_values['macd_signal_ema']}")
-            
+            else:
+                print(f"📊 No MACD values found")
             # Store the last values
             self.last_values[key] = last_values
             print(f"✅ Loaded existing state for {symbol} {timeframe}")
@@ -331,6 +329,8 @@ class IndicatorGenerator:
             
         except Exception as e:
             print(f"❌ Error loading state from DataFrame for {symbol} {timeframe}: {str(e)}")
+            # Initialize state with default values
+            self.last_values[(symbol, timeframe)] = self._initialize_empty_state()
             return False
 
     def _store_last_values_from_dataframe(self, symbol: str, timeframe: str, df: pd.DataFrame):
@@ -388,89 +388,53 @@ class IndicatorGenerator:
         self.last_values[key] = last_values
         print(f"💾 Stored last values for {symbol} {timeframe} calculations")
 
-    def smart_indicator_calculation(self, symbol: str, timeframe: str, original_df: pd.DataFrame) -> pd.DataFrame:
+    def smart_indicator_calculation(self, symbol: str, timeframe: str, original_df: pd.DataFrame, 
+                                   additional_df: pd.DataFrame = None) -> pd.DataFrame:
         """
         Smart indicator calculation that handles both bulk and incremental processing
         """
-        # Safety check: ensure original_df is not None and has data
-        if original_df is None or (hasattr(original_df, 'empty') and original_df.empty) or len(original_df) == 0:
-            print(f"❌ Error: original_df is None or empty for {symbol} {timeframe}")
-            return pd.DataFrame()  # Return empty DataFrame instead of None
-            
-        # Safety check: if additional_df is provided but empty, treat as None
-        if additional_df is not None and ((hasattr(additional_df, 'empty') and additional_df.empty) or len(additional_df) == 0):
-            print(f"📊 Additional DataFrame is empty for {symbol} {timeframe}, treating as None")
-            additional_df = None
-
+        # Treat None as empty DataFrame
+        if original_df is None:
+            original_df = pd.DataFrame()
+        if additional_df is None:
+            additional_df = pd.DataFrame()
+        # If both are empty, return empty
+        if (original_df.empty or len(original_df) == 0) and (additional_df.empty or len(additional_df) == 0):
+            print(f"❌ Both original_df and additional_df are empty for {symbol} {timeframe}")
+            return pd.DataFrame()
+        key = (symbol, timeframe)
         try:
-            key = (symbol, timeframe)
-            
-            # CASE 1: No additional_df passed - Initial bulk calculation
-            if not additional_df or (hasattr(additional_df, 'empty') and additional_df.empty):
-                print(f"📊 Initial bulk calculation for {symbol} {timeframe}")
-                print(f"📊 Processing {len(original_df)} original data points")
-                
-                # Initialize state if not exists
+            # Only additional_df present
+            if (original_df.empty or len(original_df) == 0) and (not additional_df.empty and len(additional_df) > 0):
+                print(f"📊 Only additional_df present for {symbol} {timeframe}, processing bulk on additional_df")
                 if key not in self.last_values:
-                    print(f"🔄 Initializing new state for {symbol} {timeframe}")
-                    self.last_values[key] = self._initialize_state()
-                
-                # Perform bulk calculation
-                result = self.generate_all_indicators(symbol, timeframe, original_df)
-                
-                # Store final state from bulk calculation
+                    self.initialize_indicators_state(symbol, timeframe, additional_df)
+                result = self.generate_all_indicators(symbol, timeframe, additional_df)
                 self._store_last_values_from_dataframe(symbol, timeframe, result)
-                
                 return result
-            
-            # CASE 2: Additional_df passed - Incremental calculation
+            # Only original_df present
+            if (not original_df.empty and len(original_df) > 0) and (additional_df.empty or len(additional_df) == 0):
+                print(f"📊 Only original_df present for {symbol} {timeframe}, processing bulk on original_df")
+                if key not in self.last_values:
+                    self.initialize_indicators_state(symbol, timeframe, original_df)
+                result = self.generate_all_indicators(symbol, timeframe, original_df)
+                self._store_last_values_from_dataframe(symbol, timeframe, result)
+                return result
+            # Both present: process original first, then additional on top
             print(f"⚡ Incremental calculation for {symbol} {timeframe}")
             print(f"📊 Processing {len(original_df)} original + {len(additional_df)} additional data points")
-            
-            # Check if original_df is empty - if so, use bulk calculation on additional_df
-            if len(original_df) == 0 or (hasattr(original_df, 'empty') and original_df.empty):
-                print(f"📊 Original DataFrame is empty, using bulk calculation on additional data")
-                result = self.generate_all_indicators(symbol, timeframe, additional_df)
-                
-                # Store final state from bulk calculation
-                self._store_last_values_from_dataframe(symbol, timeframe, result)
-                
-                return result
-            
-            # Check if additional_df is empty - if so, return original_df
-            if len(additional_df) == 0 or (hasattr(additional_df, 'empty') and additional_df.empty):
-                print(f"📊 Additional DataFrame is empty, returning original data")
-                return original_df
-            
-            # Initialize state if not exists
             if key not in self.last_values:
-                print(f"🔄 Initializing state for {symbol} {timeframe}...")
-                
-                # Try to load state from original data if provided
-                if len(original_df) > 0:
-                    loaded = self.load_state_from_dataframe(    
-                        symbol, timeframe, original_df
-                    )
-                    if not loaded:
-                        # Initialize with default values if loading failed
-                        self.last_values[key] = self._initialize_state()
-                        print(f"🆕 Initialized new state for {symbol} {timeframe}")
-                else:
-                    # Initialize with default values if no original data
-                    self.last_values[key] = self._initialize_state()
-                    print(f"🆕 Initialized new state for {symbol} {timeframe}")
-            
-            # Calculate indicators for additional data only
+                self.initialize_indicators_state(symbol, timeframe, original_df)
+            # Bulk on original
+            result = self.generate_all_indicators(symbol, timeframe, original_df)
+            self._store_last_values_from_dataframe(symbol, timeframe, result)
+            # Incremental on additional
             additional_with_indicators = self.calculate_real_time_indicators(
                 symbol, timeframe, additional_df
             )
-            
-            # Combine original_df and additional_df with indicators
-            final_df = pd.concat([original_df, additional_with_indicators], ignore_index=True)
-            print(f"📈 Combined {len(original_df)} original + {len(additional_with_indicators)} additional = {len(final_df)} total")
-            
+            final_df = pd.concat([result, additional_with_indicators], ignore_index=True)
+            print(f"📈 Combined {len(result)} original + {len(additional_with_indicators)} additional = {len(final_df)} total")
             return final_df
-            
         except Exception as e:
             print(f"❌ Error: {str(e)}")
             # Return original_df as fallback

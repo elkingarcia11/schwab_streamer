@@ -16,7 +16,7 @@ def get_comma_separated_items_from_file(filepath: str) -> List[str]:
         filepath: Path to the file containing comma-separated items
         
     Returns:
-        List of items (uppercase, stripped)
+        List of items (stripped)
         
     Example:
         If file contains: "SPY,QQQ,META,AMZN"
@@ -27,7 +27,8 @@ def get_comma_separated_items_from_file(filepath: str) -> List[str]:
             content = file.read().strip()
             
             # Split by comma and clean up each item
-            items = [item.strip().upper() for item in content.split(',') if item.strip()]
+            items = [item.strip() for item in content.split(',') if item.strip()]
+            print( f"📄 Read {len(items)} items from {filepath}: {items}")
             return items
     except FileNotFoundError:
         print(f"⚠️ File not found: {filepath}")

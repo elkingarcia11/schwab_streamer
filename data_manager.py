@@ -7,10 +7,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from schwab_auth import SchwabAuth
 from indicator_generator import IndicatorGenerator
-from signal_processor import SignalProcessor
-import numpy as np
+from signal_processor import SignalProcessor, Trade
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 import multiprocessing as mp
 
 
@@ -50,23 +48,22 @@ class DataManager:
                 self.indicator_generator.initialize_indicators_state(symbol, timeframe, df)
 
     def initialize_dataframe(self, symbol: str, timeframe: str):
+        """ Initialize DataFrame for a given symbol and timeframe """
+        # Check if DataFrame already exists in memory
         df = self._load_df_from_csv(symbol, timeframe)
         if df is None:
-            df = pd.DataFrame(columns=['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume'])
-        self.latestDF[(symbol, timeframe)] = df
+            print(f"🔄 Initializing new DataFrame for {symbol} {timeframe}")
+            df = pd.DataFrame(columns=pd.Index(['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'ema', 'vwma', 'roc', 'macd', 'macd_signal']))
+            # Save empty DataFrame to CSV to create the file
+            self._save_df_to_csv(df, symbol, timeframe)
+        else:
+            print(f"🔄 Loading existing DataFrame for {symbol} {timeframe}")
+        self.latestDF[f"{symbol}_{timeframe}"] = df
         return df 
 
-    def fetchDF(self, symbol: str, timeframe: str):
+    def _get_dataframe(self, symbol: str, timeframe: str):
         """Fetch the latest DataFrame for a given symbol and timeframe"""
-        df = self.latestDF[(symbol, timeframe)]
-        # Load existing DataFrame or create new one
-        if df is None:
-            # Load from CSV if exists
-            df = self._load_df_from_csv(symbol, timeframe)
-            if df is None or df.empty:
-                # Create new DataFrame with proper columns (matching CSV structure)
-                df = pd.DataFrame(columns=['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume'])
-            self.latestDF[(symbol, timeframe)] = df
+        df = self.latestDF[f"{symbol}_{timeframe}"]
         return df
     
     def _extract_frequency_number(self, interval) -> int:
@@ -139,23 +136,18 @@ class DataManager:
         """Get the CSV filename for a symbol and timeframe"""
         return f"data/{timeframe}/{symbol}.csv"
 
-    def _get_df_key(self, symbol: str, timeframe: str) -> str:
-        """Get the key for storing DataFrame in latestDF"""
-        return f"{symbol}_{timeframe}"
-
     def _load_df_from_csv(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """Load DataFrame from CSV file"""
         csv_filename = self._get_csv_filename(symbol, timeframe)
-            try:
-                df = pd.read_csv(csv_filename)
-            # Keep timestamp as numeric (milliseconds) for consistency with API data
-            # Don't convert to datetime here to avoid division errors later
-                return df
+        try:
+            df = pd.read_csv(csv_filename)
+            return df
         except FileNotFoundError:
+            print(f"❌ Error loading file {csv_filename}: File not found")
             return None
-            except Exception as e:
+        except Exception as e:
             print(f"❌ Error loading CSV file {csv_filename}: {e}")
-        return None
+            return None
 
     def _save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
         """Save DataFrame to CSV file"""
@@ -172,28 +164,28 @@ class DataManager:
         """
         csv_filename = self._get_csv_filename(symbol, timeframe)
         try:
-            # Check if file exists
-            file_exists = os.path.exists(csv_filename)
             # Convert row to DataFrame for to_csv compatibility
             row_df = row.to_frame().T
             # Prevent duplicate: check if last row in file has same timestamp
-            if file_exists:
-                try:
-                    last_row = pd.read_csv(csv_filename, nrows=1, skiprows=lambda x: x < sum(1 for _ in open(csv_filename)) - 1)
+            try:
+                # Count lines in file to get last row
+                with open(csv_filename, 'r') as f:
+                    line_count = sum(1 for _ in f)
+                
+                if line_count > 1:  # File has data beyond header
+                    last_row = pd.read_csv(csv_filename, nrows=1, skiprows=line_count-1)
                     if 'timestamp' in last_row.columns and row['timestamp'] == last_row['timestamp'].iloc[0]:
                         print(f"⚠️  Duplicate row detected for {symbol} {timeframe} (timestamp={row['timestamp']}), skipping append.")
                         return
-                except Exception as e:
-                    print(f"⚠️  Could not check for duplicate row in {csv_filename}: {e}")
-            # Append to CSV (write header only if file doesn't exist)
-            row_df.to_csv(csv_filename, mode='a', header=not file_exists, index=False)
-            if not file_exists:
-                print(f"📄 Created new CSV file: {csv_filename}")
+            except Exception as e:
+                print(f"⚠️  Could not check for duplicate row in {csv_filename}: {e}")
+            # Append to CSV (file should exist from initialize_dataframe)
+            row_df.to_csv(csv_filename, mode='a', header=False, index=False)
         except Exception as e:
             print(f"❌ Error appending to CSV {csv_filename}: {e}")
             # Fallback to full save if append fails
             try:
-                df_key = self._get_df_key(symbol, timeframe)
+                df_key = f"{symbol}_{timeframe}"
                 if df_key in self.latestDF:
                     self._save_df_to_csv(self.latestDF[df_key], symbol, timeframe)
             except Exception as fallback_error:
@@ -217,7 +209,7 @@ class DataManager:
             print("❌ Invalid symbol provided")
             return None
 
-        symbol = symbol.upper()
+        symbol = symbol
 
         # Get access token (this handles all credential validation and token refresh internally)
         access_token = self.schwab_auth.get_access_token()
@@ -334,26 +326,18 @@ class DataManager:
             print(f"⚠️  No data retrieved for {symbol}_{interval_to_fetch}m")
             return None
 
-    def _fetch_base_symbol_data(self, symbol: str, timeframe: str, 
-                               ema_period: int = None, vwma_period: int = None, roc_period: int = None,
-                               fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+    def _fetch_base_symbol_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """
         Fetch the latest data for a base symbol (not inverse) with incremental updates
         
         Args:
             symbol: Stock symbol (e.g., 'SPY')
             timeframe: Timeframe (e.g., '1m', '5m', '10m', '15m', '30m')
-            ema_period: EMA period for indicators
-            vwma_period: VWMA period for indicators
-            roc_period: ROC period for indicators
-            fast_ema: Fast EMA for MACD
-            slow_ema: Slow EMA for MACD
-            signal_ema: Signal EMA for MACD
             
         Returns:
             DataFrame with latest data and indicators, or None if failed
         """
-        df_key = self._get_df_key(symbol, timeframe)
+        df_key = f"{symbol}_{timeframe}"
         interval_minutes = self._extract_frequency_number(timeframe)
         
         print(f"🔄 Fetching base symbol data for {symbol} {timeframe}")
@@ -361,12 +345,16 @@ class DataManager:
         # Check if DataFrame exists in memory
         if df_key in self.latestDF and len(self.latestDF[df_key]) > 0:
             original_df = self.latestDF[df_key]
-            
-            # Get the last timestamp from existing data
-            last_timestamp = original_df['timestamp'].max()
-            last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
-            last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
-            
+            if timeframe == '1m':
+                # For 1m: fetch from today's market open to last completed timestamp
+                last_datetime_et = self._get_market_open_today()
+            else:
+                # Get the last timestamp from existing data
+                last_timestamp = original_df['timestamp'].max()
+                # Convert last timestamp to datetime in UTC and then to ET
+                last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
+                last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
+                
             # Fetch new data from last timestamp to current time
             end_date = self._get_last_completed_timestamp()
             
@@ -383,9 +371,7 @@ class DataManager:
                         
                         # Calculate indicators incrementally
                         result_df = self.indicator_generator.smart_indicator_calculation(
-                            symbol, timeframe, original_df, new_df,
-                            ema_period, vwma_period, roc_period,
-                            fast_ema, slow_ema, signal_ema
+                            symbol, timeframe, original_df, new_df if isinstance(new_df, pd.DataFrame) else pd.DataFrame([new_df])
                         )
                         
                         # Check if result is valid
@@ -407,128 +393,50 @@ class DataManager:
                     return original_df
             else:
                 print(f"📊 Data is already up to date for {symbol} {timeframe}")
-                return original_df
-                
+                return original_df          
         else:
-            # Try loading from CSV
-            original_df = self._load_df_from_csv(symbol, timeframe)
+            # Perform initial historical fetch
+            # No existing data, use default start dates based on timeframe
+            if timeframe == '1m':
+                # For 1m: fetch from today's market open to last completed timestamp
+                start_date = self._get_market_open_today()
+            else:
+                # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
+                start_date = self.et_tz.localize(datetime(2025, 1, 1))
+                print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
             
-            if original_df is not None and len(original_df) > 0:
-                self.latestDF[df_key] = original_df
+            end_date = self._get_last_completed_timestamp()
+            
+            print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
+            
+            if df is not None and len(df) > 0:
+                # Save to memory and CSV
+                self.latestDF[df_key] = df
+                self._save_df_to_csv(df, symbol, timeframe)
                 
-                # Check if we need to fetch new data
-                last_timestamp = original_df['timestamp'].max()
-                last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
-                last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
-                end_date = self._get_last_completed_timestamp()
-                
-                if last_datetime_et < end_date:
-                    print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
-                    
-                    if new_df is not None and len(new_df) > 0:
-                        # Filter out data that might overlap with existing data
-                        new_df = new_df[new_df['timestamp'] > last_timestamp]
-                        
-                        if len(new_df) > 0:
-                            print(f"📈 Processing {len(new_df)} new records incrementally")
-                            
-                            # Calculate indicators incrementally
-                            result_df = self.indicator_generator.smart_indicator_calculation(
-                                symbol, timeframe, original_df, new_df,
-                                ema_period, vwma_period, roc_period,
-                                fast_ema, slow_ema, signal_ema
-                            )
-                            
-                            # Check if result is valid
-                            if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
-                                print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
-                                return original_df
-                            
-                            # Save updated result and update memory
-                            self._save_df_to_csv(result_df, symbol, timeframe)
-                            self.latestDF[df_key] = result_df
-                            
-                            print(f"✅ Updated {symbol} {timeframe} with {len(new_df)} new records")
-                            return result_df
-                
-                # If no new data needed, calculate indicators on existing data
-                print(f"📊 Calculating indicators on existing data for {symbol} {timeframe}")
+                # Calculate indicators on the initial data
+                print(f"📊 Calculating indicators on initial data for {symbol} {timeframe}")
                 result_df = self.indicator_generator.smart_indicator_calculation(
-                    symbol, timeframe, original_df, None,
-                    ema_period, vwma_period, roc_period,
-                    fast_ema, slow_ema, signal_ema
+                    symbol, timeframe, df, pd.DataFrame()
                 )
                 
                 # Check if result is valid
                 if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
                     print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
-                    return original_df
+                    return None
                 
                 # Save result and update memory
                 self._save_df_to_csv(result_df, symbol, timeframe)
                 self.latestDF[df_key] = result_df
                 
+                print(f"✅ Initial fetch completed for {symbol} {timeframe} with {len(result_df)} records")
                 return result_df
-                
             else:
-                # Perform initial historical fetch
-                
-                # Try to load existing data from CSV to get the last timestamp
-                existing_df = self._load_df_from_csv(symbol, timeframe)
-                
-                if existing_df is not None and len(existing_df) > 0:
-                    # Use the last timestamp from existing data as start date
-                    last_timestamp = existing_df['timestamp'].max()
-                    last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
-                    start_date = last_datetime_utc.astimezone(self.et_tz)
-                    print(f"📊 Using last timestamp from existing data as start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                else:
-                    # No existing data, use default start dates based on timeframe
-                if timeframe == '1m':
-                    # For 1m: fetch from today's market open to last completed timestamp
-                    start_date = self._get_market_open_today()
-                else:
-                    # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
-                    start_date = self.et_tz.localize(datetime(2025, 1, 1))
-                    print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                
-                end_date = self._get_last_completed_timestamp()
-                
-                print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
-                
-                if df is not None and len(df) > 0:
-                    # Save to memory and CSV
-                    self.latestDF[df_key] = df
-                    self._save_df_to_csv(df, symbol, timeframe)
-                    
-                    # Calculate indicators on the initial data
-                    print(f"📊 Calculating indicators on initial data for {symbol} {timeframe}")
-                    result_df = self.indicator_generator.smart_indicator_calculation(
-                        symbol, timeframe, df, None,
-                        ema_period, vwma_period, roc_period,
-                        fast_ema, slow_ema, signal_ema
-                    )
-                    
-                    # Check if result is valid
-                    if result_df is None or (hasattr(result_df, 'empty') and result_df.empty) or len(result_df) == 0:
-                        print(f"❌ Error: Indicator calculation returned empty result for {symbol} {timeframe}")
-                        return original_df
-                    
-                    # Save result and update memory
-                    self._save_df_to_csv(result_df, symbol, timeframe)
-                    self.latestDF[df_key] = result_df
-                    
-                    print(f"✅ Initial fetch completed for {symbol} {timeframe} with {len(result_df)} records")
-                    return result_df
-                else:
-                    print(f"❌ Failed to fetch initial data for {symbol} {timeframe}")
-                    return None
+                print(f"❌ Failed to fetch initial data for {symbol} {timeframe}")
+                return None
 
-    def fetchLatest(self, symbol: str, timeframe: str, 
-                   ema_period: int = None, vwma_period: int = None, roc_period: int = None,
-                   fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+    def fetchLatest(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """
         Fetch the latest data for a symbol and timeframe with incremental updates
         
@@ -553,15 +461,15 @@ class DataManager:
         is_inverse = symbol.endswith('_inverse')
         base_symbol = symbol.replace('_inverse', '') if is_inverse else symbol
         
-        symbol = symbol.upper()
-        base_symbol = base_symbol.upper()
+        symbol = symbol
+        base_symbol = base_symbol
         
         print(f"🔄 Fetching latest data for {symbol} {timeframe} (inverse: {is_inverse})")
         
         # For inverse symbols, fetch the base symbol data first
         if is_inverse:
             # Fetch base symbol data
-            base_df = self._fetch_base_symbol_data(base_symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+            base_df = self._fetch_base_symbol_data(base_symbol, timeframe)
             
             if base_df is not None and len(base_df) > 0:
                 # Generate inverse data
@@ -569,9 +477,7 @@ class DataManager:
                 
                 # Calculate indicators for inverse data
                 result_df = self.indicator_generator.smart_indicator_calculation(
-                    symbol, timeframe, inverse_df, None,
-                    ema_period, vwma_period, roc_period,
-                    fast_ema, slow_ema, signal_ema
+                    symbol, timeframe, inverse_df, pd.DataFrame()
                 )
                 
                 # Check if result is valid
@@ -581,7 +487,7 @@ class DataManager:
                 
                 # Save inverse data
                 self._save_df_to_csv(result_df, symbol, timeframe)
-                df_key = self._get_df_key(symbol, timeframe)
+                df_key = f"{symbol}_{timeframe}"
                 self.latestDF[df_key] = result_df
                 
                 print(f"✅ Generated inverse data for {symbol} {timeframe} with {len(result_df)} records")
@@ -591,9 +497,9 @@ class DataManager:
                 return None
         else:
             # Regular symbol - use existing logic
-            return self._fetch_base_symbol_data(symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+            return self._fetch_base_symbol_data(symbol, timeframe)
 
-    def reset_memory(self, symbol: str = None, timeframe: str = None):
+    def reset_memory(self, symbol: Optional[str] = None, timeframe: Optional[str] = None):
         """
         Reset the in-memory DataFrame cache
         
@@ -607,22 +513,20 @@ class DataManager:
             print("🔄 Reset all in-memory DataFrames")
         elif not timeframe:
             # Reset all timeframes for symbol
-            symbol = symbol.upper()
+            symbol = symbol
             keys_to_remove = [key for key in self.latestDF.keys() if key.startswith(f"{symbol}_")]
             for key in keys_to_remove:
                 del self.latestDF[key]
             print(f"🔄 Reset all timeframes for {symbol}")
         else:
             # Reset specific symbol/timeframe
-            symbol = symbol.upper()
-            df_key = self._get_df_key(symbol, timeframe)
+            symbol = symbol
+            df_key = f"{symbol}_{timeframe}"
             if df_key in self.latestDF:
                 del self.latestDF[df_key]
                 print(f"🔄 Reset {symbol} {timeframe} from memory")
 
-    def fetchLatestWithSignals(self, symbol: str, timeframe: str, 
-                               ema_period: int = None, vwma_period: int = None, roc_period: int = None,
-                               fast_ema: int = None, slow_ema: int = None, signal_ema: int = None) -> Optional[pd.DataFrame]:
+    def fetchLatestWithSignals(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """
         Fetch the latest data for a symbol and timeframe with incremental updates and process trading signals
         
@@ -644,26 +548,26 @@ class DataManager:
         inverse_signals_processed = self.signal_processor.has_processed_signals(f"{symbol}_inverse", timeframe)
         
         # Fetch data for original symbol
-        result_df = self.fetchLatest(symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+        result_df = self.fetchLatest(symbol, timeframe)
         
         # Fetch data for inverse symbol
         inverse_symbol = f"{symbol}_inverse"
-        result_df_inverse = self.fetchLatest(inverse_symbol, timeframe, ema_period, vwma_period, roc_period, fast_ema, slow_ema, signal_ema)
+        result_df_inverse = self.fetchLatest(inverse_symbol, timeframe)
         
         # Only process signals if they haven't been processed before
         if result_df is not None:
             if not original_signals_processed:
-            # Process trading signals for the original symbol
-            self.process_signals(symbol, timeframe, result_df)
-            print(f"✅ Processed signals for {symbol} {timeframe}")
+                # Process trading signals for the original symbol
+                self.process_signals(symbol, timeframe, result_df)
+                print(f"✅ Processed signals for {symbol} {timeframe}")
             else:
                 print(f"📊 Skipped signal processing for {symbol} {timeframe} (already processed)")
             
         if result_df_inverse is not None:
             if not inverse_signals_processed:
-            # Process trading signals for the inverse symbol
-            self.process_signals(inverse_symbol, timeframe, result_df_inverse)
-            print(f"✅ Processed signals for {inverse_symbol} {timeframe}")
+                # Process trading signals for the inverse symbol
+                self.process_signals(inverse_symbol, timeframe, result_df_inverse)
+                print(f"✅ Processed signals for {inverse_symbol} {timeframe}")
             else:
                 print(f"📊 Skipped signal processing for {inverse_symbol} {timeframe} (already processed)")
             
@@ -713,15 +617,15 @@ class DataManager:
         """Get a summary of trading signals and performance"""
         return self.signal_processor.get_trade_summary()
         
-    def get_open_trades(self) -> Dict[Tuple[str, str], object]:
+    def get_open_trades(self) -> Dict[Tuple[str, str], Trade]:
         """Get all currently open trades"""
         return self.signal_processor.get_open_trades()
         
-    def get_all_trades(self) -> List[object]:
+    def get_all_trades(self) -> List[Trade]:
         """Get all trades (open and closed)"""
         return self.signal_processor.get_all_trades()
         
-    def email_trade_summary(self, subject: str = None, include_open_trades: bool = True) -> bool:
+    def email_trade_summary(self, subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
         """
         Send a comprehensive trade summary email
         
@@ -732,7 +636,7 @@ class DataManager:
         Returns:
             bool: True if email sent successfully, False otherwise
         """
-        return self.signal_processor.email_trade_summary(subject, include_open_trades)
+        return self.signal_processor.email_trade_summary(subject if subject else "", include_open_trades)
         
     def email_daily_summary(self) -> bool:
         """
@@ -766,7 +670,7 @@ class DataManager:
         return self.signal_processor.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
     
     def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
-                                              subject: str = None, include_open_trades: bool = True) -> bool:
+                                              subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
         """
         Send a comprehensive trade summary email for a specific symbol and timeframe
         
@@ -780,10 +684,10 @@ class DataManager:
             bool: True if email sent successfully, False otherwise
         """
         return self.signal_processor.email_trade_summary_by_symbol_timeframe(
-            symbol, timeframe, subject, include_open_trades
+            symbol, timeframe, subject if subject else "", include_open_trades
         )
         
-    def reset_trades(self, symbol: str = None, timeframe: str = None):
+    def reset_trades(self, symbol: Optional[str] = None, timeframe: Optional[str] = None):
         """
         Reset trades for specific symbol/timeframe or all trades
         
@@ -797,12 +701,12 @@ class DataManager:
             print("🔄 Reset all trades")
         elif not timeframe:
             # Reset all timeframes for symbol
-            symbol = symbol.upper()
+            symbol = symbol
             # This would require more complex logic to reset specific symbol trades
             print(f"🔄 Reset trades for {symbol} (all timeframes)")
         else:
             # Reset specific symbol/timeframe
-            symbol = symbol.upper()
+            symbol = symbol
             print(f"🔄 Reset trades for {symbol} {timeframe}")
 
     def _generate_inverse_row(self, row: pd.Series) -> pd.Series:
@@ -868,9 +772,7 @@ class DataManager:
 
     # ======================== PARALLEL PROCESSING METHODS ========================
     
-    def process_symbol_timeframe_parallel(self, symbol: str, timeframe: str, 
-                                        ema_period: Dict, vwma_period: Dict, roc_period: Dict,
-                                        fast_ema: Dict, slow_ema: Dict, signal_ema: Dict) -> Tuple[str, str, bool]:
+    def process_symbol_timeframe_parallel(self, symbol: str, timeframe: str) -> Tuple[str, str, bool]:
         """
         Process a single symbol-timeframe combination (for parallel execution)
         
@@ -880,13 +782,7 @@ class DataManager:
         try:
             print(f"🔄 Processing {symbol} {timeframe}")
             result = self.fetchLatestWithSignals(
-                symbol, timeframe,
-                ema_period=ema_period.get(timeframe, 7),
-                vwma_period=vwma_period.get(timeframe, 6), 
-                roc_period=roc_period.get(timeframe, 11),
-                fast_ema=fast_ema.get(timeframe, 21),
-                slow_ema=slow_ema.get(timeframe, 37),
-                signal_ema=signal_ema.get(timeframe, 15)
+                symbol, timeframe
             )
             success = result is not None and len(result) > 0
             print(f"✅ Completed {symbol} {timeframe} - {'Success' if success else 'Failed'}")
@@ -896,9 +792,7 @@ class DataManager:
             return symbol, timeframe, False
     
     def process_symbols_parallel(self, symbols: List[str], timeframes: List[str],
-                               ema_period: Dict, vwma_period: Dict, roc_period: Dict,
-                               fast_ema: Dict, slow_ema: Dict, signal_ema: Dict,
-                               max_workers: int = None) -> Dict[str, Dict[str, bool]]:
+                               max_workers: Optional[int] = None) -> Dict[str, Dict[str, bool]]:
         """
         Process multiple symbols and timeframes in parallel using ThreadPoolExecutor
         
@@ -932,8 +826,7 @@ class DataManager:
             future_to_task = {
                 executor.submit(
                     self.process_symbol_timeframe_parallel,
-                    symbol, timeframe, ema_period, vwma_period, roc_period,
-                    fast_ema, slow_ema, signal_ema
+                    symbol, timeframe
                 ): (symbol, timeframe) 
                 for symbol, timeframe in tasks
             }
@@ -959,30 +852,6 @@ class DataManager:
                     results[symbol][timeframe] = False
         
         return results
-    
-    @lru_cache(maxsize=128)
-    def _cached_api_call(self, url: str, headers_tuple: tuple) -> Optional[str]:
-        """
-        Cached API call to avoid duplicate requests
-        
-        Args:
-            url: API endpoint URL
-            headers_tuple: Headers as tuple (for hashability)
-            
-        Returns:
-            Response text or None
-        """
-        try:
-            headers = dict(headers_tuple)
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                return response.text
-            else:
-                print(f"❌ API call failed: {response.status_code}")
-                return None
-        except Exception as e:
-            print(f"❌ Cached API call error: {str(e)}")
-            return None
     
     def batch_process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, 
                             batch_size: int = 100) -> List:
@@ -1026,9 +895,7 @@ class DataManager:
         Optimize memory usage by cleaning up old data and forcing garbage collection
         """
         import gc
-        
-        # Clear old DataFrames that are no longer needed
-        keys_to_remove = []
+
         for key, df in self.latestDF.items():
             if df is not None and len(df) > 10000:  # Keep only recent data
                 # Keep only last 5000 rows
@@ -1056,80 +923,9 @@ class DataManager:
         }
         return stats
 
-    def get_bootstrap_parameters(self) -> Dict[str, Dict[str, int]]:
-        """
-        Get the bootstrap indicator parameters for all timeframes
-        
-        Returns:
-            Dict containing all indicator parameters by timeframe
-        """
-        return {
-            'ema_period': {
-                "1m": 5, "5m": 7, "10m": 9, "15m": 6, "30m": 6
-            },
-            'vwma_period': {
-                "1m": 16, "5m": 6, "10m": 5, "15m": 4, "30m": 2
-            },
-            'roc_period': {
-                "1m": 6, "5m": 11, "10m": 10, "15m": 7, "30m": 5
-            },
-            'fast_ema': {
-                "1m": 15, "5m": 21, "10m": 16, "15m": 14, "30m": 22
-            },
-            'slow_ema': {
-                "1m": 39, "5m": 37, "10m": 31, "15m": 30, "30m": 39
-            },
-            'signal_ema': {
-                "1m": 11, "5m": 15, "10m": 10, "15m": 10, "30m": 12
-            }
-        }
+
 
     def bootstrap(self):
-        # Define indicator parameters based on timeframe
-        ema_period = {
-            "1m": 5,
-            "5m": 7,
-            "10m": 9,
-            "15m": 6,
-            "30m": 6
-        }
-        vwma_period = {
-            "1m": 16,
-            "5m": 6,
-            "10m": 5,
-            "15m": 4,
-            "30m": 2
-        }
-        roc_period = {
-            "1m": 6,
-            "5m": 11,
-            "10m": 10,
-            "15m": 7,
-            "30m": 5
-        }
-        fast_ema = {
-            "1m": 15,
-            "5m": 21,
-            "10m": 16,
-            "15m": 14,
-            "30m": 22
-        }
-        slow_ema = {
-            "1m": 39,
-            "5m": 37,
-            "10m": 31,
-            "15m": 30,
-            "30m": 39
-        }
-        signal_ema = {
-            "1m": 11,
-            "5m": 15,
-            "10m": 10,
-            "15m": 10,
-            "30m": 12
-        }
-        
-        
         print(f"📊 Loaded {len(self.symbols)} symbols: {', '.join(self.symbols)}")
         print(f"⏱️  Processing {len(self.timeframes)} timeframes: {', '.join(self.timeframes)}")
         
@@ -1141,13 +937,7 @@ class DataManager:
             results = self.process_symbols_parallel(
                 symbols=self.symbols,
                 timeframes=self.timeframes,
-                ema_period=ema_period,
-                vwma_period=vwma_period,
-                roc_period=roc_period,
-                fast_ema=fast_ema,
-                slow_ema=slow_ema,
-                signal_ema=signal_ema,
-                max_workers=None  # Auto-detect optimal number of workers
+                max_workers=None
             )
             
             # Print results summary
@@ -1173,18 +963,12 @@ class DataManager:
                 for timeframe in self.timeframes:
                     print(f"🔄 Processing {symbol} {timeframe}")
                     result = self.fetchLatestWithSignals(
-                        symbol, timeframe,
-                        ema_period=ema_period.get(timeframe, 7),
-                        vwma_period=vwma_period.get(timeframe, 6),
-                        roc_period=roc_period.get(timeframe, 11),
-                        fast_ema=fast_ema.get(timeframe, 21),
-                        slow_ema=slow_ema.get(timeframe, 37),
-                        signal_ema=signal_ema.get(timeframe, 15)
+                        symbol, timeframe
                     )
                     
                     if result is not None and len(result) > 0:
                         print(f"✅ Successfully processed {symbol} {timeframe}")
-    else:
+                    else:
                         print(f"❌ Failed to process {symbol} {timeframe}")
         # Email general summary
         print("\n📧 Sending general summary email...")
@@ -1223,7 +1007,7 @@ class DataManager:
                 content = file.read().strip()
                 
                 # Split by comma and clean up each item
-                items = [item.strip().upper() for item in content.split(',') if item.strip()]
+                items = [item.strip() for item in content.split(',') if item.strip()]
                 return items
         except FileNotFoundError:
             print(f"⚠️ File not found: {filepath}")
@@ -1239,10 +1023,3 @@ class DataManager:
     def get_timeframes_from_file(self, timeframes_filepath: str) -> List[str]:
         """Get timeframes from file (alias for get_comma_separated_items_from_file)"""
         return self.get_comma_separated_items_from_file(timeframes_filepath)
-
-def main():
-    data_manager = DataManager()
-    data_manager.bootstrap()
-
-if __name__ == "__main__":
-    main()

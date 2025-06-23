@@ -100,7 +100,7 @@ class Trade:
     Represents a single trade with entry/exit details and performance metrics.
     """
     def __init__(self, symbol: str, timeframe: str, entry_time: datetime, entry_price: float):
-        self.symbol = symbol.upper()
+        self.symbol = symbol
         self.timeframe = timeframe
         self.entry_time = entry_time
         self.entry_price = entry_price
@@ -263,7 +263,7 @@ class SignalProcessor:
         
     def _get_trade_key(self, symbol: str, timeframe: str) -> Tuple[str, str]:
         """Get the key for storing trades"""
-        return (symbol.upper(), timeframe)
+        return (symbol, timeframe)
         
     def _load_trades_from_csv(self):
         """Load existing trades from CSV file"""
@@ -572,7 +572,7 @@ class SignalProcessor:
         Returns:
             Optional[Trade]: New trade if opened, None otherwise
         """
-        symbol = symbol.upper()
+        symbol = symbol
         try:
             # Debug: Entry point (only for streaming, not bootstrap)
             if not is_historical:
@@ -677,7 +677,7 @@ class SignalProcessor:
         Returns:
             List[Trade]: List of trades generated from historical data
         """
-        symbol = symbol.upper()
+        symbol = symbol
         print(f"📊 Processing historical signals for {symbol} {timeframe}")
         
         trades = []
@@ -758,7 +758,7 @@ class SignalProcessor:
         Returns:
             Dictionary with trade statistics for the specific symbol-timeframe
         """
-        symbol = symbol.upper()
+        symbol = symbol
         trade_key = (symbol, timeframe)
         
         # Filter trades for this specific symbol-timeframe
@@ -1078,7 +1078,7 @@ class SignalProcessor:
             bool: True if email sent successfully, False otherwise
         """
         try:
-            symbol = symbol.upper()
+            symbol = symbol
             
             # Get trade summary for this specific symbol-timeframe
             summary = self.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
@@ -1190,7 +1190,7 @@ class SignalProcessor:
         Returns:
             bool: True if signals have been processed (trades exist), False otherwise
         """
-        symbol = symbol.upper()
+        symbol = symbol
         return any(trade.symbol == symbol and trade.timeframe == timeframe 
                   for trade in self.all_trades)
 

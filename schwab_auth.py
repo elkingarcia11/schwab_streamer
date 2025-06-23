@@ -81,7 +81,7 @@ class SchwabAuth:
             return False
 
     def should_refresh_token_proactively(self) -> bool:
-        # If no last token refresh, refresh
+        """Check if we should proactively refresh the token based on the last refresh time"""
         if not self.last_token_refresh:
             return True
         # If time since last token refresh is greater than 20 minutes, refresh

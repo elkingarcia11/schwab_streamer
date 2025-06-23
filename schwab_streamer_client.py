@@ -18,8 +18,9 @@ import httpx
 import websocket
 import os
 import time
+import traceback
 import pandas as pd
-from typing import List
+from typing import List, Optional
 from data_manager import DataManager
 from schwab_auth import SchwabAuth
 from file_utils import get_symbols_from_file, get_timeframes_from_file
@@ -36,6 +37,8 @@ class SchwabStreamerClient:
         # Read equity symbols from file path, timeframe from file path
         self.equity_symbols = get_symbols_from_file(symbols_filepath)
         self.timeframes = get_timeframes_from_file(timeframes_filepath)
+        # Loads data from csvs into DataManager DataFrames
+        # Loads indicators from csvs into IndicatorGenerator's last_values
         self.data_manager = DataManager(self.auth, self.equity_symbols, self.timeframes)
 
         
@@ -45,7 +48,7 @@ class SchwabStreamerClient:
         self.daily_email_sent = False  # Track if 4pm email was sent today
         self.last_email_date = None    # Track the date when last email was sent
         
-        self.ws = None
+        self.ws: Optional[websocket.WebSocketApp] = None
         self.running = False
         self.connected = False
         self.request_id = 1
@@ -67,7 +70,7 @@ class SchwabStreamerClient:
         # Actual CHART_EQUITY field mappings based on observed raw data
         # Fields 2-6 are OHLCV (Open, High, Low, Close, Volume) and field 7 is timestamp
         self.chart_equity_fields = {
-            0: 'key',        # Symbol (ticker symbol in upper case)
+            0: 'key',        # Symbol (ticker symbol)
             1: 'sequence',   # Sequence - Identifies the candle minute
             2: 'open',       # Open Price - Opening price for the minute
             3: 'high',       # High Price - Highest price for the minute  
@@ -102,7 +105,8 @@ class SchwabStreamerClient:
                 print(f"📤 Sending CHART_EQUITY subscription request: {json.dumps(request, indent=2)}")
 
             # Send the subscription request
-            self.ws.send(json.dumps(request))
+            if self.ws:
+                self.ws.send(json.dumps(request))
             self.request_id += 1
 
             # Store the subscription
@@ -137,7 +141,8 @@ class SchwabStreamerClient:
 
             # Start WebSocket connection in a separate thread
             def run_ws():
-                self.ws.run_forever()
+                if self.ws:
+                    self.ws.run_forever()
 
             # Start the WebSocket thread
             ws_thread = threading.Thread(target=run_ws)
@@ -213,30 +218,42 @@ class SchwabStreamerClient:
     def parse_chart_data(self, content_item: dict) -> dict:
         """Parse CHART_EQUITY message content using field mappings"""
         try:
-            # Extract the fields array from the content
-            fields = content_item.get('fields', [])
-            if not fields or len(fields) < 9:  # We expect at least 9 fields
-                return None
-
-            # Map the fields using the chart_equity_fields mapping
+            print(f"🔍 Parsing content item: {content_item}")
             parsed = {}
-            for i, field_value in enumerate(fields):
-                if i in self.chart_equity_fields:
-                    field_name = self.chart_equity_fields[i]
-                    
-                    # Convert to appropriate data type based on field
-                    if field_name in ['open', 'high', 'low', 'close', 'volume']:
-                        parsed[field_name] = float(field_value)
-                    elif field_name in ['time', 'chart_day', 'sequence']:
-                        parsed[field_name] = int(field_value)
-                    else:
-                        parsed[field_name] = field_value
 
+            for field_key, field_value in content_item.items():
+                print(f"  Processing field: {field_key} = {field_value}")
+                if field_key.isdigit():
+                    field_index = int(field_key)
+                    if field_index in self.chart_equity_fields:
+                        field_name = self.chart_equity_fields[field_index]
+                        print(f"    Mapped to: {field_name}")
+
+                        # Convert to appropriate data type based on field
+                        if field_name in ['open', 'high', 'low', 'close', 'volume']:
+                            parsed[field_name] = float(field_value)
+                        elif field_name in ['time', 'chart_day', 'sequence']:
+                            parsed[field_name] = int(field_value)
+                        else:
+                            parsed[field_name] = field_value
+                    else:
+                        print(f"    Field index {field_index} not in chart_equity_fields mapping")
+                elif field_key in ['key', 'seq']:
+                    print(f"    Processing non-numeric key: {field_key}")
+                    if field_key == 'seq':
+                        parsed['sequence'] = int(field_value)
+                    else:
+                        parsed[field_key] = field_value
+                else:
+                    print(f"    Skipping unknown field: {field_key}")
+
+            print(f"✅ Final parsed result: {parsed}")
             return parsed
 
         except Exception as e:
             print(f"❌ Error parsing CHART_EQUITY data: {e}")
-            return None
+            traceback.print_exc()
+            return {}
 
     def on_message(self, _, message):
         """Handle WebSocket messages"""
@@ -311,16 +328,22 @@ class SchwabStreamerClient:
                             self.subscribe_chart_data(self.equity_symbols)
                 
                 elif "data" in data:
+                    print(f"Data: {data}")
                     # Market data
                     for data_item in data["data"]:
+                        print(f"Data item: {data_item}")
                         service = data_item.get("service")
                         content = data_item.get("content", [])
                         
                         if service == "CHART_EQUITY" and content:
+                            print(f"Processing {len(content)} candles for CHART_EQUITY")
                             for candle_data in content:
+                                print(f"Raw candle data: {candle_data}")
                                 # Use parse_chart_data to parse the candle data
                                 parsed_candle = self.parse_chart_data(candle_data)
+                                print(f"Parsed candle result: {parsed_candle}")
                                 if parsed_candle:
+                                    print(f"Parsed candle: {parsed_candle}")
                                     # Format for processing
                                     formatted_candle = {
                                         'timestamp': parsed_candle.get('time', 0),  # Chart Time (milliseconds since Epoch)
@@ -330,13 +353,18 @@ class SchwabStreamerClient:
                                         'close': parsed_candle.get('close', 0),     # Close Price
                                         'volume': parsed_candle.get('volume', 0)    # Volume
                                     }
-                                    
-                                    symbol = parsed_candle.get('key')  # Symbol (ticker symbol in upper case)
+                                    symbol = parsed_candle.get('key')  # Symbol (ticker symbol)
+                                    print(f"Symbol: {symbol}, Equity symbols: {self.equity_symbols}")
                                     if symbol in self.equity_symbols:
+                                        print(f"Processing new candle for {symbol}: {formatted_candle}")
                                         # Process new candle with the new workflow
                                         self.process_new_candle(symbol, '1m', formatted_candle)
                                         if self.debug:
                                             print(f"Processed new candle for {symbol}: {formatted_candle}")
+                                    else:
+                                        print(f"⚠️ Symbol {symbol} not in equity_symbols list")
+                                else:
+                                    print(f"❌ Failed to parse candle data: {candle_data}")
                 else:
                     # Handle unexpected message types
                     if self.debug:
@@ -371,27 +399,28 @@ class SchwabStreamerClient:
             access_token = self.auth.get_access_token()
             if not access_token:
                 raise Exception("Failed to get valid access token")
-
-            # Prepare login request
-            request = {
-                "service": "ADMIN",
-                "command": "LOGIN",
-                "requestid": str(self.request_id),
-                "SchwabClientCustomerId": self.schwab_client_customer_id,
-                "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
-                "parameters": {
-                    "Authorization": access_token,
-                    "SchwabClientChannel": self.streamer_info.get("schwabClientChannel", ""),
-                    "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId", "")
+            if self.streamer_info is not None:
+                # Prepare login request
+                request = {
+                    "service": "ADMIN",
+                    "command": "LOGIN",
+                    "requestid": str(self.request_id),
+                    "SchwabClientCustomerId": self.schwab_client_customer_id,
+                    "SchwabClientCorrelId": self.streamer_info.get("schwabClientCorrelId", ""),
+                    "parameters": {
+                        "Authorization": access_token,
+                        "SchwabClientChannel": self.streamer_info.get("schwabClientChannel", ""),
+                        "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId", "")
+                    }
                 }
-            }
 
-            if self.debug:
-                print(f"📤 Sending login: {json.dumps(request, indent=2)}")
+                if self.debug:
+                    print(f"📤 Sending login: {json.dumps(request, indent=2)}")
 
-            # Send login request
-            self.ws.send(json.dumps(request))
-            self.request_id += 1
+                # Send login request
+                if self.ws:
+                    self.ws.send(json.dumps(request))
+                self.request_id += 1
 
         except Exception as e:
             print(f"❌ Login error: {str(e)}")
@@ -406,68 +435,65 @@ class SchwabStreamerClient:
             timestamp_ms = candle_data['timestamp']
             timestamp_dt = pd.Timestamp(timestamp_ms, unit='ms', tz='US/Eastern')
             
-            # Create new row in the format expected by DataManager (matching CSV structure)
-            new_row = pd.Series({
-                'timestamp': timestamp_ms,  # Keep original milliseconds format
-                'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),  # Formatted datetime string
-                'open': candle_data['open'],
-                'high': candle_data['high'],
-                'low': candle_data['low'],
-                'close': candle_data['close'],
-                'volume': candle_data['volume']
-            })
-            new_inverse_row = pd.Series({
-                'timestamp': timestamp_ms,  # Keep original milliseconds format
-                'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),  # Formatted datetime string
-                'open': 1/candle_data['open'],
-                'high': 1/candle_data['high'],
-                'low': 1/candle_data['low'],
-                'close': 1/candle_data['close'],
-                'volume': candle_data['volume']
-            })
-            
-            if timeframe == '1m':
-                # Add to candle buffer for aggregation to higher timeframes
-                self.add_to_candle_buffer(symbol, timeframe)
-
-            # Fetch the DataFrame for the symbol and timeframe
-            df = self.data_manager.fetchDF(symbol, timeframe)
-            df_inverse = self.data_manager.fetchDF(f"{symbol}_inverse", timeframe)
-            
-            # Check if this candle already exists (avoid duplicates)
-            if not df.empty and len(df) > 0:
-                last_timestamp = df.iloc[-1]['timestamp']
-                # Check if the new row is within 30 seconds of the last row
-                if abs(new_row['timestamp'] - last_timestamp) < 30000:  # Within 30 seconds (30000 ms), likely duplicate
+            # Skip processing if timestamp is invalid
+            if timestamp_dt is pd.Timestamp:
+                # Create new row in the format expected by DataManager (matching CSV structure)
+                new_row = pd.Series({
+                    'timestamp': timestamp_ms,  # Keep original milliseconds format
+                    'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),  # Safe to use now
+                    'open': candle_data['open'],
+                    'high': candle_data['high'],
+                    'low': candle_data['low'],
+                    'close': candle_data['close'],
+                    'volume': candle_data['volume']
+                })
+                    
+                # Fetch the DataFrame for the symbol and timeframe
+                df = self.data_manager._get_dataframe(symbol, timeframe)
+                
+                # Initialize DataFrame if it doesn't exist
+                if df is None or df.empty:
+                    print(f"📊 Initializing new DataFrame for {symbol} {timeframe}")
+                    df = pd.DataFrame(columns=pd.Index(['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume']))
+                    self.data_manager.latestDF[f"{symbol}_{timeframe}"] = df
+                
+                # Check if this candle already exists (avoid duplicates)
+                if len(df) > 0:
+                    last_timestamp = df.iloc[-1]['timestamp']
+                    # Check if the new row is within 30 seconds of the last row
+                    if abs(new_row['timestamp'] - last_timestamp) < 30000:  # Within 30 seconds (30000 ms), likely duplicate
+                        if self.debug:
+                            print(f"🔄 Duplicate candle detected for {symbol}, skipping")
+                        return
+                
+                # Add new row to DataFrame
+                df.loc[len(df)] = new_row
+                
+                # Ensure indicator state is initialized
+                key = (symbol, timeframe)
+                if key not in self.data_manager.indicator_generator.last_values:
+                    self.data_manager.indicator_generator.initialize_indicators_state(symbol, timeframe, df)
+                
+                # Calculate indicators for the new data
+                self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df)
+                
+                # Save to CSV efficiently (append only the new row)
+                if len(df) > 0:
+                    latest_row_with_indicators = df.iloc[-1]
+                    self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
+                
+                # Process signals for the new row only (real-time processing)
+                if len(df) > 0:
+                    latest_row = df.iloc[-1]
+                    # Use data manager's process_latest_signal
+                    self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
                     if self.debug:
-                        print(f"🔄 Duplicate candle detected for {symbol}, skipping")
-                    return
-        
-            # Add new row to DataFrame
-            df.loc[len(df)] = new_row
-            df_inverse.loc[len(df_inverse)] = new_inverse_row
-            
-            self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df)
-            self.data_manager.indicator_generator.calculate_real_time_indicators(f"{symbol}_inverse", timeframe, df_inverse)
-            
-            # Save to CSV efficiently (append only the new row)
-            if len(df) > 0:
-                latest_row_with_indicators = df.iloc[-1]
-                self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
-                latest_row_with_indicators_inverse = df_inverse.iloc[-1]
-                self.data_manager.append_row_to_csv(latest_row_with_indicators_inverse, f"{symbol}_inverse", timeframe)
-            # Process signals for the new row only (real-time processing)
-            if len(df) > 0:
-                latest_row = df.iloc[-1]
-                # Use data manager's process_latest_signal which handles both original and inverse symbols
-                self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
-                latest_row_inverse = df_inverse.iloc[-1]
-                self.data_manager.process_latest_signal(f"{symbol}_inverse", timeframe, latest_row_inverse)
+                        print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
+                
+                # Print confirmation (only in debug mode to avoid spam)
                 if self.debug:
-                    print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
-            # Print confirmation (only in debug mode to avoid spam)
-            if self.debug:
-                print(f"✅ Processed new candle: {symbol} {timeframe} @ {timestamp_dt.strftime('%H:%M:%S')} Close=${candle_data['close']:.2f}")
+                    timestamp_str = timestamp_dt.strftime('%H:%M:%S') if pd.notna(timestamp_dt) else 'N/A'
+                    print(f"✅ Processed new candle: {symbol} {timeframe} @ {timestamp_str} Close=${candle_data['close']:.2f}")
 
         except Exception as e:
             print(f"❌ Error processing new candle for {symbol}: {e}")
@@ -480,7 +506,7 @@ class SchwabStreamerClient:
         Initialize candle buffer with only incomplete candles that haven't been aggregated.
         """
         try:
-            df_1m = self.data_manager.fetchDF(symbol, '1m')
+            df_1m = self.data_manager._get_dataframe(symbol, '1m')
             
             if df_1m is None or len(df_1m) == 0:
                 print(f"⚠️ No 1m data found for {symbol}, initializing empty buffer")
@@ -511,22 +537,17 @@ class SchwabStreamerClient:
                             'volume': row['volume']
                         }
                         buffer_candles.append(candle)
-                    
                     if symbol not in self.candle_buffers:
                         self.candle_buffers[symbol] = {}
                     self.candle_buffers[symbol][timeframe] = len(df_1m) % timeframe_minutes
-                    
                     if self.debug:
                         print(f"📊 {symbol} {timeframe}: {incomplete_count} incomplete candles in buffer")
-                else:
-                    # No incomplete candles
-                    if symbol not in self.candle_buffers:
-                        self.candle_buffers[symbol] = {}
-                    self.candle_buffers[symbol][timeframe] = 0
-                    
-                    if self.debug:
-                        print(f"📊 {symbol} {timeframe}: no incomplete candles")
-            
+                # No incomplete candles
+                if symbol not in self.candle_buffers:
+                    self.candle_buffers[symbol] = {}
+                self.candle_buffers[symbol][timeframe] = 0
+                if self.debug:
+                    print(f"📊 {symbol} {timeframe}: no incomplete candles")
             print(f"✅ Initialized incomplete candle buffers for {symbol}")
             
         except Exception as e:
@@ -570,16 +591,16 @@ class SchwabStreamerClient:
     def aggregate_candles(self, symbol: str, timeframe: str) -> dict:
         """Aggregate 1m candles into higher timeframe candle"""
         if symbol not in self.candle_buffers or not self.candle_buffers[symbol]:
-            return None
+            return {}
         
         # Get last timeframe candles
         timeframe_minutes = int(timeframe.replace('m', ''))
 
-        df_1m = self.data_manager.fetchDF(symbol, '1m')
+        df_1m = self.data_manager._get_dataframe(symbol, '1m')
         relevant_candles = df_1m.tail(timeframe_minutes)
         
-        if not relevant_candles:
-            return None
+        if relevant_candles.empty:
+            return {}
 
         # Aggregate OHLCV data
         aggregated_candle = {
