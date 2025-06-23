@@ -1,3 +1,16 @@
+"""
+Main client for Schwab Streaming API - OHLCV Data Collection
+    - Connects to WebSocket API
+    - Subscribes to CHART_EQUITY data
+    - Parses incoming data
+    - Stores the data on the 1-minute DataFrame
+    - Calculates indicators on the 1-minute DataFrame
+    - Aggregates the 1-minute DataFrame to higher timeframes
+    - Processes all new data to generate signals
+    - Sends daily email with trades
+    - Disconnects after sending daily email
+"""
+
 import json
 import time
 import threading
@@ -403,12 +416,23 @@ class SchwabStreamerClient:
                 'close': candle_data['close'],
                 'volume': candle_data['volume']
             })
+            new_inverse_row = pd.Series({
+                'timestamp': timestamp_ms,  # Keep original milliseconds format
+                'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),  # Formatted datetime string
+                'open': 1/candle_data['open'],
+                'high': 1/candle_data['high'],
+                'low': 1/candle_data['low'],
+                'close': 1/candle_data['close'],
+                'volume': candle_data['volume']
+            })
             
-            # Add to candle buffer for aggregation to higher timeframes
-            self.add_to_candle_buffer(symbol, timeframe, candle_data)
+            if timeframe == '1m':
+                # Add to candle buffer for aggregation to higher timeframes
+                self.add_to_candle_buffer(symbol, timeframe)
 
             # Fetch the DataFrame for the symbol and timeframe
             df = self.data_manager.fetchDF(symbol, timeframe)
+            df_inverse = self.data_manager.fetchDF(f"{symbol}_inverse", timeframe)
             
             # Check if this candle already exists (avoid duplicates)
             if not df.empty and len(df) > 0:
@@ -421,18 +445,24 @@ class SchwabStreamerClient:
         
             # Add new row to DataFrame
             df.loc[len(df)] = new_row
+            df_inverse.loc[len(df_inverse)] = new_inverse_row
             
             self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df)
+            self.data_manager.indicator_generator.calculate_real_time_indicators(f"{symbol}_inverse", timeframe, df_inverse)
             
             # Save to CSV efficiently (append only the new row)
             if len(df) > 0:
                 latest_row_with_indicators = df.iloc[-1]
                 self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
+                latest_row_with_indicators_inverse = df_inverse.iloc[-1]
+                self.data_manager.append_row_to_csv(latest_row_with_indicators_inverse, f"{symbol}_inverse", timeframe)
             # Process signals for the new row only (real-time processing)
             if len(df) > 0:
                 latest_row = df.iloc[-1]
                 # Use data manager's process_latest_signal which handles both original and inverse symbols
                 self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
+                latest_row_inverse = df_inverse.iloc[-1]
+                self.data_manager.process_latest_signal(f"{symbol}_inverse", timeframe, latest_row_inverse)
                 if self.debug:
                     print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
             # Print confirmation (only in debug mode to avoid spam)

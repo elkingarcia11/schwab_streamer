@@ -1,5 +1,8 @@
 """
 Utility functions for file operations
+    - get_comma_separated_items_from_file
+    - get_symbols_from_file
+    - get_timeframes_from_file
 """
 
 from typing import List
