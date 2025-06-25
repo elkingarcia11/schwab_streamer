@@ -175,6 +175,10 @@ class SignalProcessor:
                 df = pd.read_csv(self.open_trades_csv_path)
                 print(f"📂 Loading {len(df)} trades from {self.open_trades_csv_path}")
                 
+                # Remove duplicates based on symbol and timeframe (keep the latest entry)
+                df = df.drop_duplicates(subset=['symbol', 'timeframe'], keep='last')
+                print(f"📂 After removing duplicates: {len(df)} unique trades")
+                
                 for _, row in df.iterrows():
                     trade_data = row.to_dict()
                     trade = Trade.from_dict(trade_data)
@@ -183,6 +187,11 @@ class SignalProcessor:
                     print(f"📊 Loaded open trade: {trade.symbol} {trade.timeframe}")
                         
                 print(f"✅ Loaded {len(self.open_trades)} open trades")
+                
+                # Save the deduplicated data back to CSV
+                if len(df) > 0:
+                    df.to_csv(self.open_trades_csv_path, index=False)
+                    print(f"💾 Saved deduplicated trades back to CSV")
                 
             except Exception as e:
                 print(f"❌ Error loading trades from CSV: {e}")
@@ -318,15 +327,21 @@ class SignalProcessor:
             trade_data = [trade.to_dict() for trade in trades]
             df = pd.DataFrame(trade_data)
             
-            # Sort by exit_time descending
-            df = df.sort_values(by=['exit_time'], ascending=[False])
+            if len(df) > 0:
+                # Sort by entry_time for open trades, exit_time for closed trades
+                if is_open:
+                    df = df.sort_values(by=['entry_time'], ascending=[False])
+                else:
+                    df = df.sort_values(by=['exit_time'], ascending=[False])
                 
-            # Add to CSV if it exists, otherwise create new file and save
-            if os.path.exists(trades_csv_path):
-                df.to_csv(trades_csv_path, mode='a', header=False, index=False)
-            else:
+                # Always overwrite the file to prevent duplicates
                 df.to_csv(trades_csv_path, index=False)
-            print(f"💾 Saved {len(df)} trades to {trades_csv_path}")
+                print(f"💾 Saved {len(df)} trades to {trades_csv_path}")
+            else:
+                # If no trades, create empty file with headers
+                empty_df = pd.DataFrame(columns=pd.Index(['symbol', 'timeframe', 'entry_time', 'entry_price', 'exit_time', 'exit_price', 'pnl', 'pnl_percent', 'max_unrealized_gain', 'max_unrealized_loss', 'trade_duration_seconds']))
+                empty_df.to_csv(trades_csv_path, index=False)
+                print(f"💾 Created empty trades file at {trades_csv_path}")
             
         except Exception as e:
             print(f"❌ Error saving trades batch to CSV: {e}")
@@ -409,26 +424,41 @@ class SignalProcessor:
                 print(f"     MACD Line: {macd_line} (NaN: {pd.isna(macd_line) or str(macd_line) == 'nan'})")
                 print(f"     MACD Signal: {macd_signal} (NaN: {pd.isna(macd_signal) or str(macd_signal) == 'nan'})")
             
-            # Check for NaN values using multiple methods
-            def is_nan_value(value):
-                # Handle both scalar and pandas Series values
-                if isinstance(value, pd.Series):
-                    return value.isna().any()
-                return pd.isna(value) or str(value).lower() == 'nan' or (isinstance(value, float) and math.isnan(value))
-            
             # Check if any indicators are NaN using vectorized operations when possible
-            if any(is_nan_value(x) for x in [ema, vwma, roc, macd_line, macd_signal]):
+            if any(pd.isna(x) for x in [ema, vwma, roc, macd_line, macd_signal]):
                 if debug:
                     nan_indicators = []
-                    if is_nan_value(ema): nan_indicators.append("EMA")
-                    if is_nan_value(vwma): nan_indicators.append("VWMA")
-                    if is_nan_value(roc): nan_indicators.append("ROC")
-                    if is_nan_value(macd_line): nan_indicators.append("MACD Line")
-                    if is_nan_value(macd_signal): nan_indicators.append("MACD Signal")
+                    if pd.isna(ema): nan_indicators.append("EMA")
+                    if pd.isna(vwma): nan_indicators.append("VWMA")
+                    if pd.isna(roc): nan_indicators.append("ROC")
+                    if pd.isna(macd_line): nan_indicators.append("MACD Line")
+                    if pd.isna(macd_signal): nan_indicators.append("MACD Signal")
                     print(f"   [Buy Signal Debug] NaN indicators: {nan_indicators}")
                 return False
                 
-            # Check buy signal conditions
+            # Ensure all values are numeric before comparison
+            try:
+                ema = float(ema) if ema is not None else None
+                vwma = float(vwma) if vwma is not None else None
+                roc = float(roc) if roc is not None else None
+                macd_line = float(macd_line) if macd_line is not None else None
+                macd_signal = float(macd_signal) if macd_signal is not None else None
+                
+                # Double-check for None values after conversion
+                if any(x is None for x in [ema, vwma, roc, macd_line, macd_signal]):
+                    if debug:
+                        print(f"   [Buy Signal Debug] Non-numeric indicators after conversion - cannot check buy signal")
+                    return False
+                    
+                # At this point, all values are guaranteed to be float
+                assert ema is not None and vwma is not None and roc is not None and macd_line is not None and macd_signal is not None
+                    
+            except (ValueError, TypeError):
+                if debug:
+                    print(f"   [Buy Signal Debug] Non-numeric indicators - cannot check buy signal")
+                return False
+                
+            # Check buy signal conditions (values are guaranteed to be float at this point)
             condition1 = ema > vwma
             condition2 = roc > 0
             condition3 = macd_line > macd_signal
@@ -477,26 +507,19 @@ class SignalProcessor:
                     print(f"🛑 Stop loss triggered: {unrealized_loss_percent:.2f}% loss")
                     return True
             
-            # Get indicator values (assuming standard column names)
-            ema_col = row['ema'] if 'ema' in row else None
-            vwma_col = row['vwma'] if 'vwma' in row else None
-            roc_col = row['roc'] if 'roc' in row else None
-            macd_line_col = row['macd_line'] if 'macd_line' in row else None
-            macd_signal_col = row['macd_signal'] if 'macd_signal' in row else None
+            # Get indicator values directly from row
+            ema = row.get('ema')
+            vwma = row.get('vwma')
+            roc = row.get('roc')
+            macd_line = row.get('macd_line')
+            macd_signal = row.get('macd_signal')
             
             # Check if all required indicators are present
-            if any(x is None or len(x) == 0 for x in [ema_col, vwma_col, roc_col, macd_line_col, macd_signal_col]):
+            if any(x is None for x in [ema, vwma, roc, macd_line, macd_signal]):
                 if debug:
                     print(f"   [Sell Signal Debug] Missing indicators - cannot check sell signal")
                 return False
                 
-            # Get values
-            ema = row[ema_col]
-            vwma = row[vwma_col]
-            roc = row[roc_col]
-            macd_line = row[macd_line_col]
-            macd_signal = row[macd_signal_col]
-            
             # Check for NaN values using multiple methods
             def is_nan_value(value):
                 # Handle both scalar and pandas Series values
@@ -510,7 +533,29 @@ class SignalProcessor:
                     print(f"   [Sell Signal Debug] NaN indicators - cannot check sell signal")
                 return False
                 
-            # Check conditions
+            # Ensure all values are numeric before comparison
+            try:
+                ema = float(ema) if ema is not None else None
+                vwma = float(vwma) if vwma is not None else None
+                roc = float(roc) if roc is not None else None
+                macd_line = float(macd_line) if macd_line is not None else None
+                macd_signal = float(macd_signal) if macd_signal is not None else None
+                
+                # Double-check for None values after conversion
+                if any(x is None for x in [ema, vwma, roc, macd_line, macd_signal]):
+                    if debug:
+                        print(f"   [Sell Signal Debug] Non-numeric indicators after conversion - cannot check sell signal")
+                    return False
+                    
+                # At this point, all values are guaranteed to be float
+                assert ema is not None and vwma is not None and roc is not None and macd_line is not None and macd_signal is not None
+                    
+            except (ValueError, TypeError):
+                if debug:
+                    print(f"   [Sell Signal Debug] Non-numeric indicators - cannot check sell signal")
+                return False
+                
+            # Check conditions (values are guaranteed to be float at this point)
             condition1 = ema > vwma
             condition2 = roc > 0
             condition3 = macd_line > macd_signal

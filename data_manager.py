@@ -296,15 +296,26 @@ class DataManager:
         else:
             # Perform initial historical fetch
             # No existing data, use default start dates based on timeframe
+            end_date = self._get_last_completed_timestamp()
+            
             if timeframe == '1m':
-                # For 1m: fetch from today's market open to last completed timestamp
-                start_date = self._get_market_open_today()
+                # For 1m: check if we're outside market hours
+                now_et = datetime.now(self.et_tz)
+                current_time = now_et.time()
+                
+                # IF before market hours return, if after market hours return today's market open and market close
+                if current_time < self.market_open or current_time > self.market_close:
+                    print(f"📊 Before market hours, returning None for {symbol} {timeframe}")
+                    return None
+                else:
+                    # During market hours, use today's market open
+                    start_date = self._get_market_open_today()
+                    end_date = self._get_last_completed_timestamp()
             else:
                 # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
                 start_date = self.et_tz.localize(datetime(2025, 1, 1))
                 print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            
-            end_date = self._get_last_completed_timestamp()
+                end_date = self._get_last_completed_timestamp()
             
             print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
             df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
@@ -536,6 +547,12 @@ class DataManager:
         today_et = datetime.now(self.et_tz).date()
         market_open_dt = datetime.combine(today_et, self.market_open)
         return self.et_tz.localize(market_open_dt)
+
+    def _get_market_close_today(self) -> datetime:
+        """Get today's market close time (4:00 PM ET)"""
+        today_et = datetime.now(self.et_tz).date()
+        market_close_dt = datetime.combine(today_et, self.market_close)
+        return self.et_tz.localize(market_close_dt)
 
     def _get_valid_period(self, days_to_end: int) -> int:
         """
