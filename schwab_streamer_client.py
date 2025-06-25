@@ -450,7 +450,7 @@ class SchwabStreamerClient:
                     
                 # Fetch the DataFrame for the symbol and timeframe
                 df = self.data_manager._get_dataframe(symbol, timeframe)
-                
+                df_inverse = self.data_manager._get_dataframe(f"{symbol}_inverse", timeframe)
                 # Initialize DataFrame if it doesn't exist
                 if df is None or df.empty:
                     print(f"📊 Initializing new DataFrame for {symbol} {timeframe}")
@@ -475,25 +475,31 @@ class SchwabStreamerClient:
                     self.data_manager.indicator_generator.initialize_indicators_state(symbol, timeframe, df)
                 
                 # Calculate indicators for the new data
-                self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df)
-                
-                # Save to CSV efficiently (append only the new row)
-                if len(df) > 0:
-                    latest_row_with_indicators = df.iloc[-1]
-                    self.data_manager.append_row_to_csv(latest_row_with_indicators, symbol, timeframe)
-                
-                # Process signals for the new row only (real-time processing)
-                if len(df) > 0:
-                    latest_row = df.iloc[-1]
-                    # Use data manager's process_latest_signal
-                    self.data_manager.process_latest_signal(symbol, timeframe, latest_row)
-                    if self.debug:
-                        print(f"📊 Processed signal for {symbol} {timeframe}: Close=${latest_row['close']:.2f}")
-                
-                # Print confirmation (only in debug mode to avoid spam)
-                if self.debug:
-                    timestamp_str = timestamp_dt.strftime('%H:%M:%S') if pd.notna(timestamp_dt) else 'N/A'
-                    print(f"✅ Processed new candle: {symbol} {timeframe} @ {timestamp_str} Close=${candle_data['close']:.2f}")
+                new_row_df = pd.DataFrame([new_row])  # Convert Series to DataFrame
+                result_df, index_of_first_new_row = self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df, new_row_df)
+                    
+                 # Generate inverse data
+                new_inverse_df = self.data_manager._generate_inverse_data(new_row_df)
+
+                # Calculate indicators for inverse data
+                result_inverse_df, index_of_first_new_row_inverse = self.data_manager.indicator_generator.calculate_real_time_indicators(
+                    f"{symbol}_inverse", timeframe, df_inverse,new_inverse_df
+                )
+
+                # Process signals (returns List of trades, not DataFrame)
+                self.data_manager.process_signals(symbol, timeframe, result_df, index_of_first_new_row)
+                print(f"✅ Processed signals for {symbol} {timeframe}")
+
+                # Process trading signals for the inverse symbol
+                self.data_manager.process_signals(f"{symbol}_inverse", timeframe, result_inverse_df, index_of_first_new_row_inverse)
+                print(f"✅ Processed signals for {symbol}_inverse {timeframe}")
+                    
+                # Save df to csv
+                self.data_manager.save_df_to_csv(result_df, symbol, timeframe)
+                self.data_manager.save_df_to_csv(result_inverse_df, f"{symbol}_inverse", timeframe)
+                self.data_manager.latestDF[f"{symbol}_{timeframe}"] = result_df
+                self.data_manager.latestDF[f"{symbol}_inverse_{timeframe}"] = result_inverse_df
+                print(f"✅ Generated data for {symbol} {timeframe} and {symbol}_inverse {timeframe} with {len(result_df)} records")
 
         except Exception as e:
             print(f"❌ Error processing new candle for {symbol}: {e}")
@@ -622,7 +628,7 @@ class SchwabStreamerClient:
         """Send daily trades email and disconnect the stream"""
         try:
             print("📧 Sending daily trades email...")
-            success = self.data_manager.email_daily_summary()
+            success = self.data_manager.signal_processor.email_daily_summary()
             
             if success:
                 print("✅ Daily trades email sent successfully")

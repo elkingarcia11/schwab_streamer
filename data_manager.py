@@ -362,7 +362,7 @@ class DataManager:
         """
         return self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
         
-    def _save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
+    def save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
         """Save DataFrame to CSV file"""
         csv_filename = self._get_csv_filename(symbol, timeframe)
         try:
