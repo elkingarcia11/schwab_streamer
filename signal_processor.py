@@ -1,95 +1,7 @@
-"""
-Signal Processor Module
-Handles trade tracking, signal processing, and trade lifecycle management.
-
-The SignalProcessor tracks open trades using a mapping of (symbol, timeframe) to trade objects,
-processes buy/sell signals based on technical indicators, and manages trade persistence with
-comprehensive email notifications and risk management.
-
-CORE FEATURES:
-- Trade lifecycle management with CSV persistence
-- Real-time signal processing for buy/sell decisions
-- Email notifications for all trade actions
-- 5% stop loss risk management
-- Comprehensive trade performance tracking
-- Historical and real-time data processing
-
-SIGNAL LOGIC:
-Buy Signal (ALL 3 conditions must be met):
-1. EMA > VWMA
-2. ROC > 0  
-3. MACD Line > MACD Signal Line
-
-Sell Signal (either condition):
-1. 2+ technical conditions fail, OR
-2. 5% stop loss triggered (unrealized loss >= 5%)
-
-TRADE TRACKING:
-- Complete trade lifecycle: entry → monitoring → exit
-- Real-time P&L updates and max gain/loss tracking
-- Trade duration and performance metrics
-- CSV persistence with efficient batch/append operations
-- State recovery across program restarts
-
-EMAIL NOTIFICATIONS:
-- Buy signals: symbol, timeframe, entry_time, entry_price
-- Sell signals: complete trade details including P&L, max gain/loss, duration
-- Trade summaries: performance reports with win rates and statistics
-- Daily/weekly summary emails with comprehensive analysis
-- Stop loss alerts with detailed loss information
-
-RISK MANAGEMENT:
-- 5% automatic stop loss on all positions
-- Real-time unrealized P&L monitoring
-- Max gain/loss tracking during trade lifetime
-- Position size management (one trade per symbol/timeframe)
-
-PERFORMANCE ANALYSIS:
-- Win rate calculations
-- Total P&L tracking
-- Trade duration analysis
-- Max unrealized gain/loss per trade
-- Historical performance summaries
-
-MAIN FUNCTIONS:
-- process_historical_signals(): Bulk processing of historical data
-- process_latest_signal(): Real-time single-row processing
-- email_trade_summary(): Comprehensive performance reports
-- email_daily_summary(): Daily trade summaries
-- email_weekly_summary(): Weekly performance reports
-
-USAGE EXAMPLE:
-    signal_processor = SignalProcessor()
-    
-    # Process historical data
-    trades = signal_processor.process_historical_signals("SPY", "5m", df)
-    
-    # Process real-time data
-    new_trade = signal_processor.process_latest_signal("SPY", "5m", latest_row)
-    
-    # Send performance summary
-    signal_processor.email_trade_summary()
-    
-    # Get trade statistics
-    summary = signal_processor.get_trade_summary()
-    print(f"Win Rate: {summary['win_rate']:.1f}%")
-
-FEATURES:
-- Pure in-memory processing for optimal performance
-- Automatic state persistence and recovery
-- Smart CSV operations (batch/append/update)
-- Comprehensive email notifications
-- Robust risk management with stop losses
-- Complete trade performance tracking
-- Timezone-aware datetime operations
-- Error handling and logging
-- Scalable for multiple symbols and timeframes
-"""
-
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 import os
 from email_manager import EmailManager
 import math
@@ -111,11 +23,10 @@ class Trade:
         self.max_unrealized_gain = 0.0
         self.max_unrealized_loss = 0.0
         self.trade_duration = None
-        self.is_open = True
         
-    def update_unrealized_pnl(self, current_price: float, current_time: datetime = None):
+    def update_unrealized_pnl(self, current_price: float):
         """Update unrealized P&L and track max gain/loss"""
-        if not self.is_open:
+        if self.exit_time is not None:
             return
             
         self.pnl = current_price - self.entry_price
@@ -134,7 +45,6 @@ class Trade:
         self.pnl = exit_price - self.entry_price
         self.pnl_percent = (self.pnl / self.entry_price) * 100
         self.trade_duration = exit_time - self.entry_time
-        self.is_open = False
         
     def to_dict(self) -> dict:
         """Convert trade to dictionary for CSV storage"""
@@ -150,7 +60,6 @@ class Trade:
             'max_unrealized_gain': self.max_unrealized_gain,
             'max_unrealized_loss': self.max_unrealized_loss,
             'trade_duration_seconds': self.trade_duration.total_seconds() if self.trade_duration else None,
-            'is_open': self.is_open
         }
         
     @classmethod
@@ -192,7 +101,7 @@ class Trade:
         trade = cls(data['symbol'], data['timeframe'], entry_time, data['entry_price'])
         
         # Set other attributes if trade is closed
-        if not data['is_open'] and data['exit_time'] and str(data['exit_time']).strip() != 'nan':
+        if data['exit_time'] and str(data['exit_time']).strip() != 'nan':
             exit_time_str = str(data['exit_time']).strip()  # Remove trailing spaces
             exit_time = None
             
@@ -226,8 +135,6 @@ class Trade:
         if data.get('trade_duration_seconds') and str(data['trade_duration_seconds']).strip() != 'nan':
             trade.trade_duration = timedelta(seconds=float(data['trade_duration_seconds']))
             
-        trade.is_open = bool(data.get('is_open', True))
-        
         return trade
 
 
@@ -235,148 +142,212 @@ class SignalProcessor:
     """
     Processes trading signals and manages trade lifecycle.
     """
-    def __init__(self, trades_csv_path: str = "data/trades.csv"):
+    def __init__(self, open_trades_csv_path: str = "data/open_trades.csv", closed_trades_csv_path: str = "data/closed_trades.csv"):
         """
         Initialize the SignalProcessor.
         
         Args:
             trades_csv_path: Path to CSV file for storing trades
         """
-        self.trades_csv_path = trades_csv_path
+        self.open_trades_csv_path = open_trades_csv_path
+        self.closed_trades_csv_path = closed_trades_csv_path
         # Mapping of (symbol, timeframe) to Trade object for open trades
-        self.open_trades: Dict[Tuple[str, str], Trade] = {}
-        # List of all trades (open and closed)
-        self.all_trades: List[Trade] = []
+        self.open_trades: Dict[str, Trade] = {}
+        self.closed_trades: List[Trade] = []
         
         # Counter for periodic saving of open trades (to persist max unrealized values)
         self.update_counter = 0
-        self.save_open_trades_interval = 50  # Save open trades every 50 updates
+        self.save_open_trades_interval = 1  # Save open trades every 50 updates
         
         # Initialize email manager
         self.email_manager = EmailManager()
         
+        # Eastern Time zone for datetime operations
+        self.et_tz = pytz.timezone('US/Eastern')
+
         # Load existing trades from CSV
         self._load_trades_from_csv()
         
-        # Eastern Time zone for datetime operations
-        self.et_tz = pytz.timezone('US/Eastern')
-        
-    def _get_trade_key(self, symbol: str, timeframe: str) -> Tuple[str, str]:
-        """Get the key for storing trades"""
-        return (symbol, timeframe)
-        
     def _load_trades_from_csv(self):
-        """Load existing trades from CSV file"""
-        if os.path.exists(self.trades_csv_path):
+        """Load open trades from CSV file"""
+        if os.path.exists(self.open_trades_csv_path):
             try:
-                df = pd.read_csv(self.trades_csv_path)
-                print(f"📂 Loading {len(df)} trades from {self.trades_csv_path}")
+                df = pd.read_csv(self.open_trades_csv_path)
+                print(f"📂 Loading {len(df)} trades from {self.open_trades_csv_path}")
                 
                 for _, row in df.iterrows():
                     trade_data = row.to_dict()
                     trade = Trade.from_dict(trade_data)
-                    self.all_trades.append(trade)
-                    
-                    # Add to open trades if still open
-                    if trade.is_open:
-                        key = self._get_trade_key(trade.symbol, trade.timeframe)
-                        self.open_trades[key] = trade
-                        print(f"📊 Loaded open trade: {trade.symbol} {trade.timeframe}")
+                    key = self._get_trade_key(trade.symbol, trade.timeframe)
+                    self.open_trades[key] = trade
+                    print(f"📊 Loaded open trade: {trade.symbol} {trade.timeframe}")
                         
-                print(f"✅ Loaded {len(self.open_trades)} open trades and {len(self.all_trades)} total trades")
+                print(f"✅ Loaded {len(self.open_trades)} open trades")
                 
             except Exception as e:
                 print(f"❌ Error loading trades from CSV: {e}")
+
+    def _get_trade_key(self, symbol: str, timeframe: str) -> str:
+        """Get the key for storing trades"""
+        return f"{symbol}_{timeframe}"
+            
+    def process_historical_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, index_of_first_new_row: int) -> List[Trade]:
+        """
+        Process signals for historical data (DataFrame).
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            df: DataFrame with OHLCV data and indicators
+            
+        Returns:
+            List[Trade]: List of trades generated from historical data
+        """
+        symbol = symbol
+        print(f"📊 Processing historical signals for {symbol} {timeframe}")
+        
+
+        for index, row in list(df.iterrows())[index_of_first_new_row:]:
+            try:
+                # Use process_latest_signal with save_to_csv=False and is_historical=True for efficiency
+                self.process_latest_signal(symbol, timeframe, row, is_historical=True)    
+            except Exception as e:
+                print(f"❌ Error processing latest signals for {symbol} {timeframe} at row {index}: {e}")
+                continue
                 
-    def _save_trades_to_csv(self):
-        """Save all trades to CSV file efficiently"""
+        # Save all open trades to csv   
+        self._save_trades_batch(is_open=True)
+        # Save all closed trades to csv
+        self._save_trades_batch(is_open=False)
+
+    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series, is_historical: bool = False) -> Optional[Trade]:
+        """
+        Process signal for latest incoming data (single row).
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            row: DataFrame row with OHLCV data and indicators
+            save_to_csv: Whether to save trade changes to CSV (default: True)
+            is_historical: Whether this is historical data processing (default: False)
+            
+        Returns:
+            Optional[Trade]: New trade if opened, None otherwise
+        """
         try:
-            # Convert all trades to dictionaries
-            trade_data = [trade.to_dict() for trade in self.all_trades]
-            df = pd.DataFrame(trade_data)
-            
-            # Sort by is_open (open trades first), then by entry_time descending
-            if 'is_open' in df.columns:
-                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
-                
-            # Save to CSV
-            df.to_csv(self.trades_csv_path, index=False)
-            print(f"💾 Saved {len(df)} trades to {self.trades_csv_path}")
-            
-        except Exception as e:
-            print(f"❌ Error saving trades to CSV: {e}")
-            
-    def _save_new_trade(self, trade: Trade):
-        """Save a single new trade to CSV by appending"""
-        try:
-            # Create DataFrame for the new trade
-            trade_df = pd.DataFrame([trade.to_dict()])
-            
-            # Append to existing CSV or create new one
-            if os.path.exists(self.trades_csv_path):
-                # Append to existing file
-                trade_df.to_csv(self.trades_csv_path, mode='a', header=False, index=False)
-                print(f"💾 Appended new trade for {trade.symbol} {trade.timeframe}")
+            # Parse datetime
+            if 'datetime' in row:
+                dt_str = str(row['datetime'])  # Convert to string to handle Series/ndarray
+                if 'EST' in dt_str or 'EDT' in dt_str:
+                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S %Z')
+                else:
+                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+                    dt = self.et_tz.localize(dt)
             else:
-                # Create new file
-                trade_df.to_csv(self.trades_csv_path, index=False)
-                print(f"💾 Created new trades file with trade for {trade.symbol} {trade.timeframe}")
+                dt = datetime.now(self.et_tz)
                 
-        except Exception as e:
-            print(f"❌ Error saving new trade to CSV: {e}")
-            
-    def _update_trade_in_csv(self, trade: Trade):
-        """Update an existing trade in CSV"""
-        try:
-            if not os.path.exists(self.trades_csv_path):
-                return
-                
-            # Read existing trades
-            df = pd.read_csv(self.trades_csv_path)
-            
-            # Find the trade to update (by symbol, timeframe, and entry_time)
-            mask = (
-                (df['symbol'] == trade.symbol) & 
-                (df['timeframe'] == trade.timeframe) & 
-                (df['entry_time'] == trade.entry_time.strftime('%Y-%m-%d %H:%M:%S %Z'))
-            )
-            
-            if mask.any():
-                # Update the trade data
-                trade_dict = trade.to_dict()
-                for key, value in trade_dict.items():
-                    df.loc[mask, key] = value
-                    
-                # Save updated DataFrame
-                df.to_csv(self.trades_csv_path, index=False)
-                print(f"💾 Updated trade for {trade.symbol} {trade.timeframe}")
+            current_price = row['close']
+            key = self._get_trade_key(symbol, timeframe)
+
+            # Debug: Indicator values (only for streaming, not bootstrap)
+            if not is_historical:
+                try:
+                    ema_col = row['ema'] if 'ema' in row else None
+                    vwma_col = row['vwma'] if 'vwma' in row else None
+                    roc_col = row['roc'] if 'roc' in row else None
+                    macd_line_col = row['macd_line'] if 'macd_line' in row else None
+                    macd_signal_col = row['macd_signal'] if 'macd_signal' in row else None
+                    print(f"   EMA: {ema_col}, VWMA: {vwma_col}, ROC: {roc_col}, MACD Line: {macd_line_col}, MACD Signal: {macd_signal_col}")
+                except Exception as e:
+                    print(f"   [Debug] Could not print indicator values: {e}")
+
+            # Check for buy signal
+            buy_signal = self._check_buy_signal(row, debug=not is_historical)
+            if buy_signal:
+                if not is_historical:
+                    print(f"   [Debug] Buy signal check: {buy_signal}")
+                if key not in self.open_trades:
+                    # Open new trade
+                    trade = Trade(symbol, timeframe, dt, float(current_price))
+                    self.open_trades[key] = trade
+                    if not is_historical:
+                        print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
+                        self._send_buy_email(trade)  # Send buy email notification
+                        self._save_new_trade(trade)  # Efficiently save new trade
+                    return trade
+
+            # Check for sell signal on existing open trade
+            if key in self.open_trades:
+                trade = self.open_trades[key]
+                sell_signal = self._check_sell_signal(row, float(current_price), trade.entry_price, debug=not is_historical)
+                if not is_historical:
+                    print(f"   [Debug] Sell signal check: {sell_signal}")
+                if sell_signal:
+                    # Close trade
+                    trade.close_trade(dt, float(current_price))
+                    del self.open_trades[key]
+                    self.closed_trades.append(trade)
+                    # Only print and send email for real-time signals, not historical
+                    if not is_historical:
+                        print(f"🔴 SELL: Closed trade for {symbol} {timeframe} at {current_price:.2f}, P&L: {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
+                        self._send_sell_email(trade)  # Send sell email notification
+                        self._save_closed_trade(trade)
+                else:
+                    # Update unrealized P&L and max gain/loss for every row
+                    trade.update_unrealized_pnl(float(current_price))
+                    if not is_historical:
+                        print(f"   [Debug] No sell signal. Updated unrealized P&L for open trade.")
             else:
-                print(f"⚠️  Trade not found in CSV for update: {trade.symbol} {trade.timeframe}")
-                
+                if not is_historical:
+                    print(f"   [Debug] No open trade for {symbol} {timeframe}.")
         except Exception as e:
-            print(f"❌ Error updating trade in CSV: {e}")
-            
-    def _save_trades_batch(self, trades: List[Trade] = None):
+            print(f"❌ Error processing latest signal for {symbol} {timeframe}: {e}")
+        return None
+        
+    def _save_trades_batch(self, is_open: bool = True):
         """Save multiple trades efficiently (for batch operations)"""
-        if not trades:
-            trades = self.all_trades
-            
+        if is_open:
+            trades = self.open_trades.values()
+            trades_csv_path = self.open_trades_csv_path
+        else:
+            trades = self.closed_trades
+            trades_csv_path = self.closed_trades_csv_path
+
         try:
             # Convert trades to dictionaries
             trade_data = [trade.to_dict() for trade in trades]
             df = pd.DataFrame(trade_data)
             
-            # Sort by is_open (open trades first), then by entry_time descending
-            if 'is_open' in df.columns:
-                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
+            # Sort by exit_time descending
+            df = df.sort_values(by=['exit_time'], ascending=[False])
                 
-            # Save to CSV
-            df.to_csv(self.trades_csv_path, index=False)
-            print(f"💾 Saved {len(df)} trades to {self.trades_csv_path}")
+            # Add to CSV if it exists, otherwise create new file and save
+            if os.path.exists(trades_csv_path):
+                df.to_csv(trades_csv_path, mode='a', header=False, index=False)
+            else:
+                df.to_csv(trades_csv_path, index=False)
+            print(f"💾 Saved {len(df)} trades to {trades_csv_path}")
             
         except Exception as e:
             print(f"❌ Error saving trades batch to CSV: {e}")
+
+
+    def _save_closed_trade(self, trade: Trade):
+        """Save a closed trade to CSV"""
+        try:
+            # Create DataFrame for the closed trade
+            trade_df = pd.DataFrame([trade.to_dict()])
             
+            # Append to existing CSV or create new one
+            if os.path.exists(self.closed_trades_csv_path):
+                trade_df.to_csv(self.closed_trades_csv_path, mode='a', header=False, index=False)
+            else:
+                trade_df.to_csv(self.closed_trades_csv_path, index=False)
+            print(f"💾 Saved closed trade to {self.closed_trades_csv_path}")
+            
+        except Exception as e:
+            print(f"❌ Error saving closed trade to CSV: {e}")
+
     def _check_buy_signal(self, row: pd.Series, debug: bool = False) -> bool:
         """
         Check if buy signal conditions are met.
@@ -395,11 +366,11 @@ class SignalProcessor:
         """
         try:
             # Get indicator values (assuming standard column names)
-            ema_col = [col for col in row.index if col.startswith('ema_')]
-            vwma_col = [col for col in row.index if col.startswith('vwma_')]
-            roc_col = [col for col in row.index if col.startswith('roc_')]
-            macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
-            macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
+            ema_col = 'ema' if 'ema' in row else None
+            vwma_col = 'vwma' if 'vwma' in row else None 
+            roc_col = 'roc' if 'roc' in row else None
+            macd_line_col = 'macd_line' if 'macd_line' in row else None
+            macd_signal_col = 'macd_signal' if 'macd_signal' in row else None
             
             # ENHANCED DEBUG: Check if all required indicators are present
             if debug:
@@ -411,23 +382,23 @@ class SignalProcessor:
                 print(f"     MACD Signal columns found: {macd_signal_col}")
             
             # Check if all required indicators are present
-            if not (ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col):
+            if any(x is None or len(x) == 0 for x in [ema_col, vwma_col, roc_col, macd_line_col, macd_signal_col]):
                 if debug:
                     missing_indicators = []
-                    if not ema_col: missing_indicators.append("EMA")
-                    if not vwma_col: missing_indicators.append("VWMA")
-                    if not roc_col: missing_indicators.append("ROC")
-                    if not macd_line_col: missing_indicators.append("MACD Line")
-                    if not macd_signal_col: missing_indicators.append("MACD Signal")
+                    if ema_col is None or len(ema_col) == 0: missing_indicators.append("EMA") 
+                    if vwma_col is None or len(vwma_col) == 0: missing_indicators.append("VWMA")
+                    if roc_col is None or len(roc_col) == 0: missing_indicators.append("ROC")
+                    if macd_line_col is None or len(macd_line_col) == 0: missing_indicators.append("MACD Line")
+                    if macd_signal_col is None or len(macd_signal_col) == 0: missing_indicators.append("MACD Signal")
                     print(f"   [Buy Signal Debug] Missing indicators: {missing_indicators}")
                 return False
                 
             # Get values
-            ema = row[ema_col[0]]
-            vwma = row[vwma_col[0]]
-            roc = row[roc_col[0]]
-            macd_line = row[macd_line_col[0]]
-            macd_signal = row[macd_signal_col[0]]
+            ema = row[ema_col]
+            vwma = row[vwma_col]
+            roc = row[roc_col]
+            macd_line = row[macd_line_col]
+            macd_signal = row[macd_signal_col]
             
             # ENHANCED DEBUG: Check for NaN values
             if debug:
@@ -440,9 +411,13 @@ class SignalProcessor:
             
             # Check for NaN values using multiple methods
             def is_nan_value(value):
+                # Handle both scalar and pandas Series values
+                if isinstance(value, pd.Series):
+                    return value.isna().any()
                 return pd.isna(value) or str(value).lower() == 'nan' or (isinstance(value, float) and math.isnan(value))
             
-            if is_nan_value(ema) or is_nan_value(vwma) or is_nan_value(roc) or is_nan_value(macd_line) or is_nan_value(macd_signal):
+            # Check if any indicators are NaN using vectorized operations when possible
+            if any(is_nan_value(x) for x in [ema, vwma, roc, macd_line, macd_signal]):
                 if debug:
                     nan_indicators = []
                     if is_nan_value(ema): nan_indicators.append("EMA")
@@ -475,7 +450,7 @@ class SignalProcessor:
             print(f"❌ Error checking buy signal: {e}")
             return False
             
-    def _check_sell_signal(self, row: pd.Series, current_price: float = None, entry_price: float = None, debug: bool = False) -> bool:
+    def _check_sell_signal(self, row: pd.Series, current_price: Optional[float] = None, entry_price: Optional[float] = None, debug: bool = False) -> bool:
         """
         Check if sell signal conditions are met.
         
@@ -503,30 +478,34 @@ class SignalProcessor:
                     return True
             
             # Get indicator values (assuming standard column names)
-            ema_col = [col for col in row.index if col.startswith('ema_')]
-            vwma_col = [col for col in row.index if col.startswith('vwma_')]
-            roc_col = [col for col in row.index if col.startswith('roc_')]
-            macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
-            macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
+            ema_col = row['ema'] if 'ema' in row else None
+            vwma_col = row['vwma'] if 'vwma' in row else None
+            roc_col = row['roc'] if 'roc' in row else None
+            macd_line_col = row['macd_line'] if 'macd_line' in row else None
+            macd_signal_col = row['macd_signal'] if 'macd_signal' in row else None
             
             # Check if all required indicators are present
-            if not (ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col):
+            if any(x is None or len(x) == 0 for x in [ema_col, vwma_col, roc_col, macd_line_col, macd_signal_col]):
                 if debug:
                     print(f"   [Sell Signal Debug] Missing indicators - cannot check sell signal")
                 return False
                 
             # Get values
-            ema = row[ema_col[0]]
-            vwma = row[vwma_col[0]]
-            roc = row[roc_col[0]]
-            macd_line = row[macd_line_col[0]]
-            macd_signal = row[macd_signal_col[0]]
+            ema = row[ema_col]
+            vwma = row[vwma_col]
+            roc = row[roc_col]
+            macd_line = row[macd_line_col]
+            macd_signal = row[macd_signal_col]
             
             # Check for NaN values using multiple methods
             def is_nan_value(value):
+                # Handle both scalar and pandas Series values
+                if isinstance(value, pd.Series):
+                    return value.isna().any()
                 return pd.isna(value) or str(value).lower() == 'nan' or (isinstance(value, float) and math.isnan(value))
             
-            if is_nan_value(ema) or is_nan_value(vwma) or is_nan_value(roc) or is_nan_value(macd_line) or is_nan_value(macd_signal):
+            # Check if any indicators are NaN using vectorized operations when possible
+            if any(is_nan_value(x) for x in [ema, vwma, roc, macd_line, macd_signal]):
                 if debug:
                     print(f"   [Sell Signal Debug] NaN indicators - cannot check sell signal")
                 return False
@@ -557,165 +536,16 @@ class SignalProcessor:
         except Exception as e:
             print(f"❌ Error checking sell signal: {e}")
             return False
-            
-    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series, save_to_csv: bool = True, is_historical: bool = False) -> Optional[Trade]:
-        """
-        Process signal for latest incoming data (single row).
+
+    
         
-        Args:
-            symbol: Stock symbol
-            timeframe: Timeframe
-            row: DataFrame row with OHLCV data and indicators
-            save_to_csv: Whether to save trade changes to CSV (default: True)
-            is_historical: Whether this is historical data processing (default: False)
-            
-        Returns:
-            Optional[Trade]: New trade if opened, None otherwise
-        """
-        symbol = symbol
-        try:
-            # Debug: Entry point (only for streaming, not bootstrap)
-            if not is_historical:
-                print(f"\n🔍 [SignalProcessor] process_latest_signal called for {symbol} {timeframe}")
-                if 'close' in row:
-                    print(f"   Close price: {row['close']}")
-                if 'datetime' in row:
-                    print(f"   Datetime: {row['datetime']}")
-                
-                # NEW DEBUG: Print all column names to see what's available
-                print(f"   [Debug] All columns in row: {list(row.index)}")
-            
-            # Parse datetime
-            if 'datetime' in row:
-                dt_str = row['datetime']
-                if 'EST' in dt_str or 'EDT' in dt_str:
-                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S %Z')
-                else:
-                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
-                    dt = self.et_tz.localize(dt)
-            else:
-                dt = datetime.now(self.et_tz)
-            current_price = row['close']
-            key = self._get_trade_key(symbol, timeframe)
-            # Debug: Indicator values (only for streaming, not bootstrap)
-            if not is_historical:
-                try:
-                    ema_col = [col for col in row.index if col.startswith('ema_')]
-                    vwma_col = [col for col in row.index if col.startswith('vwma_')]
-                    roc_col = [col for col in row.index if col.startswith('roc_')]
-                    macd_line_col = [col for col in row.index if col.startswith('macd_line_')]
-                    macd_signal_col = [col for col in row.index if col.startswith('macd_signal_')]
-                    if ema_col and vwma_col and roc_col and macd_line_col and macd_signal_col:
-                        print(f"   EMA: {row[ema_col[0]]}, VWMA: {row[vwma_col[0]]}, ROC: {row[roc_col[0]]}, MACD Line: {row[macd_line_col[0]]}, MACD Signal: {row[macd_signal_col[0]]}")
-                except Exception as e:
-                    print(f"   [Debug] Could not print indicator values: {e}")
-            # Check for buy signal
-            buy_signal = self._check_buy_signal(row, debug=not is_historical)
-            if not is_historical:
-                print(f"   [Debug] Buy signal check: {buy_signal}")
-            if buy_signal:
-                if key not in self.open_trades:
-                    # Open new trade
-                    trade = Trade(symbol, timeframe, dt, current_price)
-                    self.open_trades[key] = trade
-                    self.all_trades.append(trade)
-                    if save_to_csv:
-                        self._save_new_trade(trade)  # Efficiently save new trade
-                    # Only print and send email for real-time signals, not historical
-                    if not is_historical:
-                        print(f"🟢 BUY: Opened trade for {symbol} {timeframe} at {current_price:.2f}")
-                        self._send_buy_email(trade)  # Send buy email notification
-                    return trade
-            # Check for sell signal on existing open trade
-            if key in self.open_trades:
-                trade = self.open_trades[key]
-                sell_signal = self._check_sell_signal(row, current_price, trade.entry_price, debug=not is_historical)
-                if not is_historical:
-                    print(f"   [Debug] Sell signal check: {sell_signal}")
-                if sell_signal:
-                    # Close trade
-                    trade.close_trade(dt, current_price)
-                    del self.open_trades[key]
-                    if save_to_csv:
-                        self._update_trade_in_csv(trade)  # Update existing trade
-                    # Only print and send email for real-time signals, not historical
-                    if not is_historical:
-                        print(f"🔴 SELL: Closed trade for {symbol} {timeframe} at {current_price:.2f}, P&L: {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
-                        self._send_sell_email(trade)  # Send sell email notification
-                else:
-                    # Update unrealized P&L and max gain/loss for every row
-                    trade.update_unrealized_pnl(current_price, dt)
-                    if not is_historical:
-                        print(f"   [Debug] No sell signal. Updated unrealized P&L for open trade.")
-            else:
-                if not is_historical:
-                    print(f"   [Debug] No open trade for {symbol} {timeframe}.")
-            # Update max unrealized gain/loss for any existing open trade (even if no signals triggered)
-            if key in self.open_trades:
-                trade = self.open_trades[key]
-                trade.update_unrealized_pnl(current_price, dt)
-            # Periodically save open trades to persist max unrealized gain/loss values
-            # Only for real-time processing (not historical) to avoid excessive writes
-            if not is_historical and self.open_trades:
-                self.update_counter += 1
-                if self.update_counter >= self.save_open_trades_interval:
-                    self._save_open_trades_to_csv()
-                    self.update_counter = 0  # Reset counter
-        except Exception as e:
-            print(f"❌ Error processing latest signal for {symbol} {timeframe}: {e}")
-        return None
-        
-    def process_historical_signals(self, symbol: str, timeframe: str, df: pd.DataFrame) -> List[Trade]:
-        """
-        Process signals for historical data (DataFrame).
-        
-        Args:
-            symbol: Stock symbol
-            timeframe: Timeframe
-            df: DataFrame with OHLCV data and indicators
-            
-        Returns:
-            List[Trade]: List of trades generated from historical data
-        """
-        symbol = symbol
-        print(f"📊 Processing historical signals for {symbol} {timeframe}")
-        
-        trades = []
-        
-        for index, row in df.iterrows():
-            try:
-                # Use process_latest_signal with save_to_csv=False and is_historical=True for efficiency
-                new_trade = self.process_latest_signal(symbol, timeframe, row, save_to_csv=False, is_historical=True)
-                if new_trade:
-                    trades.append(new_trade)
-                        
-            except Exception as e:
-                print(f"❌ Error processing row {index}: {e}")
-                continue
-                
-        # Save all trades to CSV efficiently (batch save for historical processing)
-        if trades:
-            self._save_trades_batch()
-        
-        # Save open trades to persist max unrealized gain/loss values
-        if self.open_trades:
-            self._save_open_trades_to_csv()
-            print(f"💾 Persisted max unrealized values for {len(self.open_trades)} open trades")
-        
-        print(f"✅ Processed {len(trades)} new trades from historical data")
-        return trades
-        
-    def get_open_trades(self) -> Dict[Tuple[str, str], Trade]:
-        """Get all currently open trades"""
-        return self.open_trades.copy()
-        
-    def get_all_trades(self) -> List[Trade]:
-        """Get all trades (open and closed)"""
-        return self.all_trades.copy()
+    ########################################################
+    # Streaming functions
+    ########################################################
         
     def get_trade_summary(self) -> dict:
         """Get summary statistics of all trades"""
-        if not self.all_trades:
+        if not self.closed_trades:
             return {
                 'total_trades': 0,
                 'open_trades': 0,
@@ -727,8 +557,8 @@ class SignalProcessor:
                 'win_rate': 0.0
             }
             
-        closed_trades = [t for t in self.all_trades if not t.is_open]
-        open_trades = [t for t in self.all_trades if t.is_open]
+        closed_trades = self.closed_trades
+        open_trades = self.open_trades.values()
         
         total_pnl = sum(t.pnl for t in closed_trades)
         avg_pnl = total_pnl / len(closed_trades) if closed_trades else 0.0
@@ -737,7 +567,7 @@ class SignalProcessor:
         win_rate = (winning_trades / len(closed_trades) * 100) if closed_trades else 0
         
         return {
-            'total_trades': len(self.all_trades),
+            'total_trades': len(self.closed_trades) + len(self.open_trades),
             'open_trades': len(open_trades),
             'closed_trades': len(closed_trades),
             'total_pnl': total_pnl,
@@ -759,15 +589,14 @@ class SignalProcessor:
             Dictionary with trade statistics for the specific symbol-timeframe
         """
         symbol = symbol
-        trade_key = (symbol, timeframe)
+        trade_key = f"{symbol}_{timeframe}"
         
         # Filter trades for this specific symbol-timeframe
-        all_trades = self.get_all_trades()
-        filtered_trades = [trade for trade in all_trades 
+        filtered_trades = [trade for trade in self.closed_trades 
                           if trade.symbol == symbol and trade.timeframe == timeframe]
         
         # Get closed trades for calculations
-        closed_trades = [trade for trade in filtered_trades if not trade.is_open]
+        closed_trades = filtered_trades
         
         if not closed_trades:
             # Check if there's an open trade
@@ -837,7 +666,7 @@ class SignalProcessor:
             'current_unrealized_loss': open_trade.max_unrealized_loss if open_trade else 0.0
         }
         
-    def email_trade_summary(self, subject: str = None, include_open_trades: bool = True) -> bool:
+    def email_trade_summary(self, subject: Optional[str], include_open_trades: bool = True) -> bool:
         """
         Send a comprehensive trade summary email
         
@@ -855,7 +684,7 @@ class SignalProcessor:
             # Get open trades if requested
             open_trades_list = []
             if include_open_trades:
-                open_trades_list = self.get_open_trades()
+                open_trades_list = self.open_trades.values()
             
             # Create subject
             if subject:
@@ -879,7 +708,7 @@ class SignalProcessor:
             # Add closed trades breakdown if any exist
             if summary['closed_trades'] > 0:
                 body += "📋 Closed Trades Breakdown:\n"
-                closed_trades = [t for t in self.all_trades if not t.is_open]
+                closed_trades = self.closed_trades
                 
                 # Sort by exit time (most recent first) with timezone handling
                 et_tz = pytz.timezone('US/Eastern')
@@ -913,7 +742,9 @@ class SignalProcessor:
             if include_open_trades and open_trades_list:
                 body += f"\n📈 Current Open Trades ({len(open_trades_list)}):\n"
                 
-                for key, trade in open_trades_list.items():
+                for trade in open_trades_list:
+                    if isinstance(trade, str):
+                        continue
                     pnl_emoji = "📈" if trade.pnl >= 0 else "📉"
                     entry_time = trade.entry_time.strftime('%Y-%m-%d %H:%M:%S %Z')
                     
@@ -942,8 +773,9 @@ class SignalProcessor:
 
 ⚠️ Disclaimer: This is automated analysis, not financial advice.
 """
-            
             # Send email
+            if subject is None:
+                subject = "Trade Summary"  # Provide default subject if None
             return self.email_manager._send_email(subject, body)
             
         except Exception as e:
@@ -1026,45 +858,10 @@ class SignalProcessor:
         except Exception as e:
             print(f"❌ Error sending sell email: {e}")
 
-    def _save_open_trades_to_csv(self):
-        """Save current open trades to CSV to persist max unrealized gain/loss"""
-        try:
-            if not self.open_trades:
-                return
-                
-            if not os.path.exists(self.trades_csv_path):
-                return
-                
-            # Read existing trades
-            df = pd.read_csv(self.trades_csv_path)
-            
-            # Update each open trade in the CSV
-            for trade in list(self.open_trades.values()):
-                mask = (
-                    (df['symbol'] == trade.symbol) & 
-                    (df['timeframe'] == trade.timeframe) & 
-                    (df['entry_time'] == trade.entry_time.strftime('%Y-%m-%d %H:%M:%S %Z'))
-                )
-                
-                if mask.any():
-                    # Update the trade data with current max unrealized values
-                    trade_dict = trade.to_dict()
-                    for key, value in trade_dict.items():
-                        df.loc[mask, key] = value
-            
-            # Sort by is_open (open trades first), then by entry_time descending
-            if 'is_open' in df.columns:
-                df = df.sort_values(by=['is_open', 'entry_time'], ascending=[False, False])
-                
-            # Save updated DataFrame
-            df.to_csv(self.trades_csv_path, index=False)
-            print(f"💾 Updated {len(self.open_trades)} open trades with max unrealized values")
-                
-        except Exception as e:
-            print(f"❌ Error saving open trades to CSV: {e}")
+
 
     def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
-                                              subject: str = None, include_open_trades: bool = True) -> bool:
+                                              subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
         """
         Send a comprehensive trade summary email for a specific symbol and timeframe.
         
@@ -1128,8 +925,7 @@ class SignalProcessor:
 
 """
                 # Get all trades for this symbol-timeframe
-                all_trades = self.get_all_trades()
-                symbol_trades = [trade for trade in all_trades 
+                symbol_trades = [trade for trade in self.closed_trades 
                                if trade.symbol == symbol and trade.timeframe == timeframe]
                 
                 # Sort by entry time (ensure timezone consistency)
@@ -1144,17 +940,17 @@ class SignalProcessor:
                 symbol_trades.sort(key=get_entry_time_for_sorting)
                 
                 for i, trade in enumerate(symbol_trades[-10:], 1):  # Show last 10 trades
-                    status = "🔄 OPEN" if trade.is_open else "✅ CLOSED"
+                    status = "🔄 OPEN" if trade.exit_time is None else "✅ CLOSED"
                     entry_time = trade.entry_time.strftime('%Y-%m-%d %H:%M')
                     
-                    if trade.is_open:
+                    if trade.exit_time is None:
                         body += f"{i:2d}. {status} | Entry: {entry_time} @ ${trade.entry_price:.2f} | Current P&L: ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%)\n"
                     else:
-                        exit_time = trade.exit_time.strftime('%Y-%m-%d %H:%M')
+                        # Handle case where exit_time could be None
+                        exit_time = trade.exit_time.strftime('%Y-%m-%d %H:%M') if trade.exit_time else 'N/A'
                         duration_hours = trade.trade_duration.total_seconds() / 3600 if trade.trade_duration else 0
                         profit_indicator = "📈" if trade.pnl > 0 else "📉"
                         body += f"{i:2d}. {status} | {entry_time} → {exit_time} | ${trade.entry_price:.2f} → ${trade.exit_price:.2f} | {profit_indicator} ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%) | {duration_hours:.1f}h\n"
-                
                 if len(symbol_trades) > 10:
                     body += f"\n... and {len(symbol_trades) - 10} more trades\n"
             
@@ -1192,17 +988,17 @@ class SignalProcessor:
         """
         symbol = symbol
         return any(trade.symbol == symbol and trade.timeframe == timeframe 
-                  for trade in self.all_trades)
+                  for trade in self.closed_trades)
 
     def drop_closed_trades_and_save_only_open(self):
         """Drop all closed trades from CSV and keep only open trades."""
-        if os.path.exists(self.trades_csv_path):
+        if os.path.exists(self.closed_trades_csv_path):
             try:
-                df = pd.read_csv(self.trades_csv_path)
-                if 'is_open' in df.columns:
-                    open_trades = df[df['is_open'] == True]
-                    open_trades.to_csv(self.trades_csv_path, index=False)
-                    print(f"🧹 Dropped closed trades, kept {len(open_trades)} open trades in {self.trades_csv_path}")
+                df = pd.read_csv(self.closed_trades_csv_path)
+                if 'exit_time' in df.columns:
+                    open_trades = df[df['exit_time'] == None]
+                    open_trades.to_csv(self.open_trades_csv_path, index=False)
+                    print(f"🧹 Dropped closed trades, kept {len(open_trades)} open trades in {self.open_trades_csv_path}")
             except Exception as e:
                 print(f"❌ Error dropping closed trades: {e}")
 
@@ -1212,21 +1008,23 @@ class SignalProcessor:
         if now.hour >= 16:
             subject = f"Trade Log for {now.strftime('%Y-%m-%d')}"
             body = "Attached is the trade log for today."
-            self.email_manager.send_trade_log_email(self.trades_csv_path, subject=subject, body=body)
+            self.email_manager.send_trade_log_email(self.open_trades_csv_path, subject=subject, body=body)
 
-if __name__ == "__main__":
-    # Example usage
-    signal_processor = SignalProcessor()
-    
-    # Example of processing historical data
-    print("📊 Signal Processor initialized")
-    
-    # Get summary
-    summary = signal_processor.get_trade_summary()
-    print(f"📈 Trade Summary: {summary}")
-    
-    # Get open trades
-    open_trades = signal_processor.get_open_trades()
-    print(f"📊 Open Trades: {len(open_trades)}")
-    for key, trade in open_trades.items():
-        print(f"  {trade.symbol} {trade.timeframe}: Entry {trade.entry_price:.2f}, P&L {trade.pnl:.2f} ({trade.pnl_percent:.2f}%)")
+    def _save_new_trade(self, trade: Trade):
+        """Save a single new trade to CSV by appending"""
+        try:
+            # Create DataFrame for the new trade
+            trade_df = pd.DataFrame([trade.to_dict()])
+            
+            # Append to existing CSV or create new one
+            if os.path.exists(self.open_trades_csv_path):
+                # Append to existing file
+                trade_df.to_csv(self.open_trades_csv_path, mode='a', header=False, index=False)
+                print(f"💾 Appended new trade for {trade.symbol} {trade.timeframe}")
+            else:
+                # Create new file
+                trade_df.to_csv(self.open_trades_csv_path, index=False)
+                print(f"💾 Created new trades file with trade for {trade.symbol} {trade.timeframe}")
+                
+        except Exception as e:
+            print(f"❌ Error saving new trade to CSV: {e}")

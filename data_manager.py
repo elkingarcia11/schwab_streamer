@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from schwab_auth import SchwabAuth
 from indicator_generator import IndicatorGenerator
-from signal_processor import SignalProcessor, Trade
+from signal_processor import SignalProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 
@@ -65,81 +65,6 @@ class DataManager:
         self.latestDF[f"{symbol}_{timeframe}"] = df
         return df 
 
-    def _get_dataframe(self, symbol: str, timeframe: str):
-        """Fetch the latest DataFrame for a given symbol and timeframe"""
-        df = self.latestDF[f"{symbol}_{timeframe}"]
-        return df
-    
-    def _extract_frequency_number(self, interval) -> int:
-        """Extract numeric frequency from interval string (e.g., '5m' -> 5) or return int if already int"""
-        try:
-            # If it's already an integer, return it directly
-            if isinstance(interval, int):
-                return interval
-            # If it's a string, extract the number
-            return int(interval.replace('m', '').replace('h', '').replace('d', ''))
-        except (ValueError, AttributeError):
-            print(f"⚠️  Invalid interval format: {interval}, defaulting to 1")
-            return 1
-
-    def _get_valid_period(self, days_to_end: int) -> int:
-        """
-        Get the largest valid period that's not greater than days_to_end.
-        Valid periods for periodType=day are [1, 2, 3, 4, 5, 10].
-        
-        Args:
-            days_to_end: Number of days to the end date
-            timeframe: Timeframe string (e.g., '1m', '5m') to determine default period
-            
-        Returns:
-            int: Valid period to use for API call
-        """
-        valid_periods = [1, 2, 3, 4, 5, 10]
-        
-        # Use period=10 for better compatibility with the API
-        default_period = 10
-        
-        # Find the largest valid period that fits within our date range
-        # If default_period fits, use it; otherwise use the largest available
-        if default_period <= days_to_end:
-            return default_period
-        else:
-            return max([p for p in valid_periods if p <= days_to_end])
-
-    def _get_market_open_today(self) -> datetime:
-        """Get today's market open time (9:30 AM ET)"""
-        today_et = datetime.now(self.et_tz).date()
-        market_open_dt = datetime.combine(today_et, self.market_open)
-        return self.et_tz.localize(market_open_dt)
-
-    def _get_last_completed_timestamp(self) -> datetime:
-        """Get the last completed timestamp during market hours (ET)"""
-        now_et = datetime.now(self.et_tz)
-        today_et = now_et.date()
-        
-        # Check if it's currently market hours
-        current_time = now_et.time()
-        
-        # If it's before market open or after market close, use previous trading day
-        if current_time < self.market_open or current_time > self.market_close:
-            # Use previous trading day (skip weekends)
-            days_back = 1
-            if today_et.weekday() == 0:  # Monday
-                days_back = 3  # Go back to Friday
-            elif today_et.weekday() == 6:  # Sunday
-                days_back = 2  # Go back to Friday
-            
-            previous_trading_day = today_et - timedelta(days=days_back)
-            end_time = datetime.combine(previous_trading_day, self.market_close)
-            return self.et_tz.localize(end_time)
-        else:
-            # During market hours, use current time
-            return now_et
-
-    def _get_csv_filename(self, symbol: str, timeframe: str) -> str:
-        """Get the CSV filename for a symbol and timeframe"""
-        return f"data/{timeframe}/{symbol}.csv"
-
     def _load_df_from_csv(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """Load DataFrame from CSV file"""
         csv_filename = self._get_csv_filename(symbol, timeframe)
@@ -153,211 +78,9 @@ class DataManager:
             print(f"❌ Error loading CSV file {csv_filename}: {e}")
             return None
 
-    def _save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
-        """Save DataFrame to CSV file"""
-        csv_filename = self._get_csv_filename(symbol, timeframe)
-        try:
-            df.to_csv(csv_filename, index=False)
-            print(f"💾 Saved {len(df)} records to {csv_filename}")
-        except Exception as e:
-            print(f"❌ Error saving CSV {csv_filename}: {e}")
-
-    def append_row_to_csv(self, row: pd.Series, symbol: str, timeframe: str):
-        """
-        Efficiently append a single row to CSV file for real-time streaming
-        """
-        csv_filename = self._get_csv_filename(symbol, timeframe)
-        try:
-            # Convert row to DataFrame for to_csv compatibility
-            row_df = row.to_frame().T
-            # Prevent duplicate: check if last row in file has same timestamp
-            try:
-                # Count lines in file to get last row
-                with open(csv_filename, 'r') as f:
-                    line_count = sum(1 for _ in f)
-                
-                if line_count > 1:  # File has data beyond header
-                    last_row = pd.read_csv(csv_filename, nrows=1, skiprows=line_count-1)
-                    if 'timestamp' in last_row.columns and row['timestamp'] == last_row['timestamp'].iloc[0]:
-                        print(f"⚠️  Duplicate row detected for {symbol} {timeframe} (timestamp={row['timestamp']}), skipping append.")
-                        return
-            except Exception as e:
-                print(f"⚠️  Could not check for duplicate row in {csv_filename}: {e}")
-            # Append to CSV (file should exist from initialize_dataframe)
-            row_df.to_csv(csv_filename, mode='a', header=False, index=False)
-        except Exception as e:
-            print(f"❌ Error appending to CSV {csv_filename}: {e}")
-            # Fallback to full save if append fails
-            try:
-                df_key = f"{symbol}_{timeframe}"
-                if df_key in self.latestDF:
-                    self._save_df_to_csv(self.latestDF[df_key], symbol, timeframe)
-            except Exception as fallback_error:
-                print(f"❌ Fallback save also failed: {fallback_error}")
-
-    def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame) -> List:
-        """
-        Process trading signals for a DataFrame
-        
-        Args:
-            symbol: Stock symbol
-            timeframe: Timeframe
-            df: DataFrame with OHLCV data and indicators
-            
-        Returns:
-            List of trades generated
-        """
-        return self.signal_processor.process_historical_signals(symbol, timeframe, df)
-        
-    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series):
-        """
-        Process signal for latest incoming data (single row)
-        
-        Args:
-            symbol: Stock symbol
-            timeframe: Timeframe
-            row: DataFrame row with OHLCV data and indicators
-            
-        Returns:
-            Optional[Trade]: New trade if opened, None otherwise
-        """
-        # Process signal for original symbol
-        original_trade = self.signal_processor.process_latest_signal(symbol, timeframe, row)
-        
-        # Generate inverse data from the original row
-        inverse_row = self._generate_inverse_row(row)
-        
-        # Process signal for inverse symbol
-        inverse_symbol = f"{symbol}_inverse"
-        inverse_trade = self.signal_processor.process_latest_signal(inverse_symbol, timeframe, inverse_row)
-        
-        # Return the original trade for backward compatibility
-        return original_trade
-        
-    def get_trade_summary(self) -> Dict[str, float]:
-        """Get a summary of trading signals and performance"""
-        return self.signal_processor.get_trade_summary()
-        
-    def get_open_trades(self) -> Dict[Tuple[str, str], Trade]:
-        """Get all currently open trades"""
-        return self.signal_processor.get_open_trades()
-        
-    def get_all_trades(self) -> List[Trade]:
-        """Get all trades (open and closed)"""
-        return self.signal_processor.get_all_trades()
-        
-    def email_trade_summary(self, subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
-        """
-        Send a comprehensive trade summary email
-        
-        Args:
-            subject: Custom email subject (optional)
-            include_open_trades: Whether to include current open trades in the email
-            
-        Returns:
-            bool: True if email sent successfully, False otherwise
-        """
-        return self.signal_processor.email_trade_summary(subject if subject else "", include_open_trades)
-        
-    def email_daily_summary(self) -> bool:
-        """
-        Send a daily trade summary email
-        
-        Returns:
-            bool: True if email sent successfully, False otherwise
-        """
-        return self.signal_processor.email_daily_summary()
-        
-    def email_weekly_summary(self) -> bool:
-        """
-        Send a weekly trade summary email
-        
-        Returns:
-            bool: True if email sent successfully, False otherwise
-        """
-        return self.signal_processor.email_weekly_summary()
-        
-    def get_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str) -> Dict[str, float]:
-        """
-        Get a summary of trading signals and performance for a specific symbol and timeframe
-        
-        Args:
-            symbol: Trading symbol (e.g., 'SPY')
-            timeframe: Timeframe (e.g., '5m')
-            
-        Returns:
-            Dictionary with trade statistics for the specific symbol-timeframe
-        """
-        return self.signal_processor.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
-    
-    def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
-                                              subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
-        """
-        Send a comprehensive trade summary email for a specific symbol and timeframe
-        
-        Args:
-            symbol: Trading symbol (e.g., 'SPY')
-            timeframe: Timeframe (e.g., '5m')
-            subject: Custom email subject (optional)
-            include_open_trades: Whether to include current open trades in the email
-            
-        Returns:
-            bool: True if email sent successfully, False otherwise
-        """
-        return self.signal_processor.email_trade_summary_by_symbol_timeframe(
-            symbol, timeframe, subject if subject else "", include_open_trades
-        )
-        
-    def reset_trades(self, symbol: Optional[str] = None, timeframe: Optional[str] = None):
-        """
-        Reset trades for specific symbol/timeframe or all trades
-        
-        Args:
-            symbol: Specific symbol to reset (if None, reset all)
-            timeframe: Specific timeframe to reset (if None, reset all for symbol)
-        """
-        if not symbol:
-            # Reset all trades
-            self.signal_processor = SignalProcessor()
-            print("🔄 Reset all trades")
-        elif not timeframe:
-            # Reset all timeframes for symbol
-            symbol = symbol
-            # This would require more complex logic to reset specific symbol trades
-            print(f"🔄 Reset trades for {symbol} (all timeframes)")
-        else:
-            # Reset specific symbol/timeframe
-            symbol = symbol
-            print(f"🔄 Reset trades for {symbol} {timeframe}")
-
-    def _generate_inverse_row(self, row: pd.Series) -> pd.Series:
-        """
-        Generate inverse OHLC data from a single row of original symbol data.
-        
-        Args:
-            row: Series with OHLCV data
-            
-        Returns:
-            Series with inverse OHLC data (1/price) and same volume/timestamps
-        """
-        inverse_row = row.copy()
-        
-        # Generate inverse prices (1/price)
-        inverse_row['open'] = 1.0 / row['open']
-        inverse_row['high'] = 1.0 / row['high']
-        inverse_row['low'] = 1.0 / row['low']
-        inverse_row['close'] = 1.0 / row['close']
-        
-        # Note: For inverse data, we need to swap high/low since 1/high < 1/low
-        # when original high > low
-        temp_high = inverse_row['high']
-        inverse_row['high'] = inverse_row['low']
-        inverse_row['low'] = temp_high
-        
-        # Keep volume, timestamps, and indicators the same
-        # (volume, timestamp, and indicator columns remain unchanged)
-        
-        return inverse_row
+    ########################################################
+    # Backfill functions
+    ########################################################
 
     def bootstrap(self):
         """
@@ -485,8 +208,9 @@ class DataManager:
 
         # Fetch original data 
         original_df = self._get_dataframe(symbol, timeframe)
+
         # Calculate indicators for original data
-        result_df = self.indicator_generator.calculate_real_time_indicators(
+        result_df, index_of_first_new_row = self.indicator_generator.calculate_real_time_indicators(
             symbol, timeframe, original_df, new_df
         )
 
@@ -494,16 +218,16 @@ class DataManager:
         new_inverse_df = self._generate_inverse_data(new_df)
 
         # Calculate indicators for inverse data
-        result_inverse_df = self.indicator_generator.calculate_real_time_indicators(
+        result_inverse_df, index_of_first_new_row_inverse = self.indicator_generator.calculate_real_time_indicators(
             f"{symbol}_inverse", timeframe, original_df,new_inverse_df
         )
 
         # Process signals (returns List of trades, not DataFrame)
-        self.process_signals(symbol, timeframe, result_df)
+        self.process_signals(symbol, timeframe, result_df, index_of_first_new_row)
         print(f"✅ Processed signals for {symbol} {timeframe}")
 
         # Process trading signals for the inverse symbol
-        self.process_signals(f"{symbol}_inverse", timeframe, result_inverse_df)
+        self.process_signals(f"{symbol}_inverse", timeframe, result_inverse_df, index_of_first_new_row_inverse)
         print(f"✅ Processed signals for {symbol}_inverse {timeframe}")
             
         # Save data
@@ -514,26 +238,6 @@ class DataManager:
                     
         print(f"✅ Generated data for {symbol} {timeframe} and {symbol}_inverse {timeframe} with {len(result_df)} records")
         return True
-
-    def _generate_inverse_data(self, new_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Generate inverse OHLC data from original symbol data.
-        
-        Args:
-            df: DataFrame with OHLCV data
-            
-        Returns:
-            DataFrame with inverse OHLC data (1/price) and same volume/timestamps
-        """
-        new_inverse_df = new_df.copy()
-        
-        # Generate inverse prices (1/price)
-        new_inverse_df['open'] = 1.0 / new_df['open']
-        new_inverse_df['high'] = 1.0 / new_df['low']
-        new_inverse_df['low'] = 1.0 / new_df['high']
-        new_inverse_df['close'] = 1.0 / new_df['close']
-
-        return new_inverse_df
 
     def _fetch_base_symbol_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """
@@ -607,6 +311,91 @@ class DataManager:
             
             return df
     
+    def _get_dataframe(self, symbol: str, timeframe: str):
+        """Fetch the latest DataFrame for a given symbol and timeframe"""
+        df = self.latestDF[f"{symbol}_{timeframe}"]
+        return df
+    
+    def _generate_inverse_data(self, new_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate inverse OHLC data from original symbol data.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with inverse OHLC data (1/price) and same volume/timestamps
+        """
+        new_inverse_df = new_df.copy()
+        
+        # Generate inverse prices (1/price)
+        new_inverse_df['open'] = 1.0 / new_df['open']
+        new_inverse_df['high'] = 1.0 / new_df['low']
+        new_inverse_df['low'] = 1.0 / new_df['high']
+        new_inverse_df['close'] = 1.0 / new_df['close']
+
+        return new_inverse_df
+
+
+    def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, index_of_first_new_row: int) -> List:
+        """
+        Process trading signals for a DataFrame
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            df: DataFrame with OHLCV data and indicators
+            
+        Returns:
+            List of trades generated
+        """
+        return self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
+        
+    def _save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
+        """Save DataFrame to CSV file"""
+        csv_filename = self._get_csv_filename(symbol, timeframe)
+        try:
+            df.to_csv(csv_filename, index=False)
+            print(f"💾 Saved {len(df)} records to {csv_filename}")
+        except Exception as e:
+            print(f"❌ Error saving CSV {csv_filename}: {e}")
+
+    def _extract_frequency_number(self, interval) -> int:
+        """Extract numeric frequency from interval string (e.g., '5m' -> 5) or return int if already int"""
+        try:
+            # If it's already an integer, return it directly
+            if isinstance(interval, int):
+                return interval
+            # If it's a string, extract the number
+            return int(interval.replace('m', '').replace('h', '').replace('d', ''))
+        except (ValueError, AttributeError):
+            print(f"⚠️  Invalid interval format: {interval}, defaulting to 1")
+            return 1
+
+    def _get_last_completed_timestamp(self) -> datetime:
+        """Get the last completed timestamp during market hours (ET)"""
+        now_et = datetime.now(self.et_tz)
+        today_et = now_et.date()
+        
+        # Check if it's currently market hours
+        current_time = now_et.time()
+        
+        # If it's before market open or after market close, use previous trading day
+        if current_time < self.market_open or current_time > self.market_close:
+            # Use previous trading day (skip weekends)
+            days_back = 1
+            if today_et.weekday() == 0:  # Monday
+                days_back = 3  # Go back to Friday
+            elif today_et.weekday() == 6:  # Sunday
+                days_back = 2  # Go back to Friday
+            
+            previous_trading_day = today_et - timedelta(days=days_back)
+            end_time = datetime.combine(previous_trading_day, self.market_close)
+            return self.et_tz.localize(end_time)
+        else:
+            # During market hours, use current time
+            return now_et
+
     def _fetch_data_from_schwab(self, symbol: str, start_date: datetime, end_date: datetime, 
                                interval_to_fetch: int) -> Optional[pd.DataFrame]:
         """
@@ -741,3 +530,142 @@ class DataManager:
         else:
             print(f"⚠️  No data retrieved for {symbol}_{interval_to_fetch}m")
             return None
+
+    def _get_market_open_today(self) -> datetime:
+        """Get today's market open time (9:30 AM ET)"""
+        today_et = datetime.now(self.et_tz).date()
+        market_open_dt = datetime.combine(today_et, self.market_open)
+        return self.et_tz.localize(market_open_dt)
+
+    def _get_valid_period(self, days_to_end: int) -> int:
+        """
+        Get the largest valid period that's not greater than days_to_end.
+        Valid periods for periodType=day are [1, 2, 3, 4, 5, 10].
+        
+        Args:
+            days_to_end: Number of days to the end date
+            timeframe: Timeframe string (e.g., '1m', '5m') to determine default period
+            
+        Returns:
+            int: Valid period to use for API call
+        """
+        valid_periods = [1, 2, 3, 4, 5, 10]
+        
+        # Use period=10 for better compatibility with the API
+        default_period = 10
+        
+        # Find the largest valid period that fits within our date range
+        # If default_period fits, use it; otherwise use the largest available
+        if default_period <= days_to_end:
+            return default_period
+        else:
+            return max([p for p in valid_periods if p <= days_to_end])
+    
+    def _get_csv_filename(self, symbol: str, timeframe: str) -> str:
+        """Get the CSV filename for a symbol and timeframe"""
+        return f"data/{timeframe}/{symbol}.csv"
+
+
+    ########################################################
+    # Streaming functions
+    ########################################################
+
+    def append_row_to_csv(self, row: pd.Series, symbol: str, timeframe: str):
+        """
+        Efficiently append a single row to CSV file for real-time streaming
+        """
+        csv_filename = self._get_csv_filename(symbol, timeframe)
+        try:
+            # Convert row to DataFrame for to_csv compatibility
+            row_df = row.to_frame().T
+            # Prevent duplicate: check if last row in file has same timestamp
+            try:
+                # Count lines in file to get last row
+                with open(csv_filename, 'r') as f:
+                    line_count = sum(1 for _ in f)
+                
+                if line_count > 1:  # File has data beyond header
+                    last_row = pd.read_csv(csv_filename, nrows=1, skiprows=line_count-1)
+                    if 'timestamp' in last_row.columns and row['timestamp'] == last_row['timestamp'].iloc[0]:
+                        print(f"⚠️  Duplicate row detected for {symbol} {timeframe} (timestamp={row['timestamp']}), skipping append.")
+                        return
+            except Exception as e:
+                print(f"⚠️  Could not check for duplicate row in {csv_filename}: {e}")
+            # Append to CSV (file should exist from initialize_dataframe)
+            row_df.to_csv(csv_filename, mode='a', header=False, index=False)
+        except Exception as e:
+            print(f"❌ Error appending to CSV {csv_filename}: {e}")
+            # Fallback to full save if append fails
+            try:
+                df_key = f"{symbol}_{timeframe}"
+                if df_key in self.latestDF:
+                    self._save_df_to_csv(self.latestDF[df_key], symbol, timeframe)
+            except Exception as fallback_error:
+                print(f"❌ Fallback save also failed: {fallback_error}")
+
+    def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series):
+        """
+        Process signal for latest incoming data (single row)
+        
+        Args:
+            symbol: Stock symbol
+            timeframe: Timeframe
+            row: DataFrame row with OHLCV data and indicators
+            
+        Returns:
+            Optional[Trade]: New trade if opened, None otherwise
+        """
+        # Process signal for original symbol
+        original_trade = self.signal_processor.process_latest_signal(symbol, timeframe, row)
+        
+        # Generate inverse data from the original row
+        inverse_row = self._generate_inverse_row(row)
+        
+        # Process signal for inverse symbol
+        inverse_symbol = f"{symbol}_inverse"
+        inverse_trade = self.signal_processor.process_latest_signal(inverse_symbol, timeframe, inverse_row)
+        
+        # Return the original trade for backward compatibility
+        return original_trade
+        
+    def _generate_inverse_row(self, row: pd.Series) -> pd.Series:
+        """
+        Generate inverse OHLC data from a single row of original symbol data.
+        
+        Args:
+            row: Series with OHLCV data
+            
+        Returns:
+            Series with inverse OHLC data (1/price) and same volume/timestamps
+        """
+        inverse_row = row.copy()
+        
+        # Generate inverse prices (1/price)
+        inverse_row['open'] = 1.0 / row['open']
+        inverse_row['high'] = 1.0 / row['high']
+        inverse_row['low'] = 1.0 / row['low']
+        inverse_row['close'] = 1.0 / row['close']
+        
+        # Note: For inverse data, we need to swap high/low since 1/high < 1/low
+        # when original high > low
+        temp_high = inverse_row['high']
+        inverse_row['high'] = inverse_row['low']
+        inverse_row['low'] = temp_high
+        
+        # Keep volume, timestamps, and indicators the same
+        # (volume, timestamp, and indicator columns remain unchanged)
+        
+        return inverse_row
+
+def main():
+    """
+    Main function to run the DataManager
+    """
+    schwab_auth = SchwabAuth()
+    symbols = ['SPY']
+    timeframes = ['1m','5m']
+    data_manager = DataManager(schwab_auth, symbols, timeframes)
+    data_manager.bootstrap()
+
+if __name__ == "__main__":
+    main()

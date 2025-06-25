@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
-import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 class IndicatorGenerator:
 
@@ -444,30 +443,3 @@ class IndicatorGenerator:
         except Exception as e:
             print(f"❌ Error processing {symbol} {timeframe}: {str(e)}")
             return df
-
-    def load_indicator_states(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
-        """
-        Loads indicator state from data/{timeframe}/{symbol}.csv if it exists.
-        Returns a pandas DataFrame or None if the file does not exist.
-        """
-        file_path = os.path.join('data', timeframe, f'{symbol}.csv')
-        if os.path.exists(file_path):
-            try:
-                df = pd.read_csv(file_path)
-                return df
-            except Exception as e:
-                print(f"Error loading indicator state for {symbol} {timeframe}: {e}")
-                return None
-        return None
-
-    def save_indicator_states(self, symbol: str, timeframe: str, df: pd.DataFrame):
-        """
-        Saves indicator state to data/{timeframe}/{symbol}.csv.
-        """
-        dir_path = os.path.join('data', timeframe)
-        os.makedirs(dir_path, exist_ok=True)
-        file_path = os.path.join(dir_path, f'{symbol}.csv')
-        try:
-            df.to_csv(file_path, index=False)
-        except Exception as e:
-            print(f"Error saving indicator state for {symbol} {timeframe}: {e}")
