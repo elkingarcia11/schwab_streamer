@@ -10,6 +10,7 @@ from indicator_generator import IndicatorGenerator
 from signal_processor import SignalProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing as mp
+import numpy as np
 
 
 class DataManager:
@@ -59,7 +60,7 @@ class DataManager:
             print(f"🔄 Initializing new DataFrame for {symbol} {timeframe}")
             df = pd.DataFrame(columns=pd.Index(['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'ema', 'vwma', 'roc', 'macd_line', 'macd_signal']))
             # Save empty DataFrame to CSV to create the file
-            self._save_df_to_csv(df, symbol, timeframe)
+            self.save_df_to_csv(df, symbol, timeframe)
         else:
             print(f"🔄 Loading existing DataFrame for {symbol} {timeframe}")
         self.latestDF[f"{symbol}_{timeframe}"] = df
@@ -70,6 +71,16 @@ class DataManager:
         csv_filename = self._get_csv_filename(symbol, timeframe)
         try:
             df = pd.read_csv(csv_filename)
+            
+            # Ensure indicator columns exist (for backward compatibility with old CSV files)
+            required_columns = ['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'ema', 'vwma', 'roc', 'macd_line', 'macd_signal']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                print(f"📊 Adding missing indicator columns to {symbol} {timeframe}: {missing_columns}")
+                for col in missing_columns:
+                    df[col] = np.nan
+            
             return df
         except FileNotFoundError:
             print(f"❌ Error loading file {csv_filename}: File not found")
@@ -107,6 +118,22 @@ class DataManager:
         
         success_rate = (total_success / total_tasks) * 100 if total_tasks > 0 else 0
         print(f"\n🎯 Success Rate: {total_success}/{total_tasks} ({success_rate:.1f}%)")
+        
+        # Send email with open trades data after all signals are processed
+        print("\n📧 Sending open trades email after bootstrap completion...")
+        try:
+            success = self.signal_processor.email_trade_summary(
+                subject="📊 Open Trades Report - Bootstrap Complete",
+                include_open_trades=True
+            )
+            if success:
+                print("✅ Open trades email sent successfully")
+            else:
+                print("❌ Failed to send open trades email")
+        except Exception as e:
+            print(f"❌ Error sending open trades email: {e}")
+        
+        print("✅ Bootstrap process completed")
 
     def process_symbols_parallel(self, symbols: List[str], timeframes: List[str],
                                 max_workers: Optional[int] = None) -> Dict[str, Dict[str, bool]]:
@@ -231,8 +258,8 @@ class DataManager:
         print(f"✅ Processed signals for {symbol}_inverse {timeframe}")
             
         # Save data
-        self._save_df_to_csv(result_df, symbol, timeframe)
-        self._save_df_to_csv(result_inverse_df, f"{symbol}_inverse", timeframe)
+        self.save_df_to_csv(result_df, symbol, timeframe)
+        self.save_df_to_csv(result_inverse_df, f"{symbol}_inverse", timeframe)
         self.latestDF[f"{symbol}_{timeframe}"] = result_df
         self.latestDF[f"{symbol}_inverse_{timeframe}"] = result_inverse_df
                     
@@ -262,17 +289,68 @@ class DataManager:
             last_timestamp = original_df['timestamp'].max()
             # Convert last timestamp to datetime in UTC and then to ET
             last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
+            last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
+            
+            # For 1m data, ensure we don't fetch before today's market open
             if timeframe == '1m':
-                last_datetime_et = max(last_datetime_utc.astimezone(self.et_tz), self._get_market_open_today())
-            else:
-                last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
+                market_open_today = self._get_market_open_today()
+                if last_datetime_et < market_open_today:
+                    last_datetime_et = market_open_today
+                    print(f"📊 Adjusting start time to today's market open: {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 
             # Fetch new data from last timestamp to current time
             end_date = self._get_last_completed_timestamp()
             
+            # Ensure we're not trying to fetch outside market hours
             if last_datetime_et < end_date:
-                print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
+                # For non-1m timeframes, check if the gap crosses market hours boundaries
+                if timeframe != '1m':
+                    # If the gap crosses overnight, we need to handle it properly
+                    last_date = last_datetime_et.date()
+                    end_date_obj = end_date.date()
+                    
+                    if last_date < end_date_obj:
+                        # Gap crosses overnight - we should only fetch up to yesterday's market close
+                        # and then separately fetch from today's market open
+                        yesterday_close = datetime.combine(last_date, self.market_close)
+                        yesterday_close = self.et_tz.localize(yesterday_close)
+                        
+                        if last_datetime_et < yesterday_close:
+                            print(f"📡 Fetching data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {yesterday_close.strftime('%Y-%m-%d %H:%M:%S %Z')} (yesterday's close)")
+                            new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, yesterday_close, interval_minutes)
+                            
+                            if new_df is not None and len(new_df) > 0:
+                                # Filter out data that might overlap with existing data
+                                new_df = new_df[new_df['timestamp'] > last_timestamp]
+                                
+                                if len(new_df) > 0:
+                                    print(f"📈 Processing {len(new_df)} new records from yesterday")
+                                    if isinstance(new_df, pd.Series):
+                                        new_df = new_df.to_frame().T
+                                    return new_df
+                        
+                        # Now check if we should fetch today's data
+                        today_open = self._get_market_open_today()
+                        if end_date > today_open:
+                            print(f"📡 Fetching data from {today_open.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')} (today's market hours)")
+                            today_df = self._fetch_data_from_schwab(symbol, today_open, end_date, interval_minutes)
+                            
+                            if today_df is not None and len(today_df) > 0:
+                                print(f"📈 Processing {len(today_df)} new records from today")
+                                if isinstance(today_df, pd.Series):
+                                    today_df = today_df.to_frame().T
+                                return today_df
+                        
+                        print(f"📊 No new data available for {symbol} {timeframe}")
+                        return None
+                    else:
+                        # Same day fetch
+                        print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                        new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
+                else:
+                    # For 1m data, just fetch the gap
+                    print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
                 
                 if new_df is not None and len(new_df) > 0:
                     # Filter out data that might overlap with existing data
@@ -360,7 +438,15 @@ class DataManager:
         Returns:
             List of trades generated
         """
-        return self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
+        print(f"🔍 [DEBUG] process_signals called for {symbol} {timeframe}")
+        print(f"🔍 [DEBUG] DataFrame shape: {df.shape}, index_of_first_new_row: {index_of_first_new_row}")
+        
+        if len(df) > 0:
+            print(f"🔍 [DEBUG] Last row data: {df.iloc[-1].to_dict()}")
+        
+        result = self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
+        print(f"🔍 [DEBUG] process_historical_signals returned: {len(result) if result else 0} trades")
+        return result
         
     def save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
         """Save DataFrame to CSV file"""
@@ -517,6 +603,11 @@ class DataManager:
                     dt_utc = datetime.fromtimestamp(timestamp_ms / 1000, tz=pytz.UTC)
                     dt_et = dt_utc.astimezone(self.et_tz)
                     
+                    # Filter out data outside market hours (9:30 AM - 4:00 PM ET)
+                    candle_time = dt_et.time()
+                    if candle_time < self.market_open or candle_time > self.market_close:
+                        continue  # Skip this candle
+                    
                     df_data.append({
                         'timestamp': timestamp_ms,
                         'datetime': dt_et.strftime('%Y-%m-%d %H:%M:%S %Z'),
@@ -532,7 +623,7 @@ class DataManager:
                 # Sort by timestamp and remove duplicates
                 df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp'])
                 
-                print(f"✅ Processed {len(df)} records from API")
+                print(f"✅ Processed {len(df)} records from API (filtered to market hours only)")
                 return df
 
             except Exception as e:
@@ -616,7 +707,7 @@ class DataManager:
             try:
                 df_key = f"{symbol}_{timeframe}"
                 if df_key in self.latestDF:
-                    self._save_df_to_csv(self.latestDF[df_key], symbol, timeframe)
+                    self.save_df_to_csv(self.latestDF[df_key], symbol, timeframe)
             except Exception as fallback_error:
                 print(f"❌ Fallback save also failed: {fallback_error}")
 

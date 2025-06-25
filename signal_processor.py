@@ -214,20 +214,39 @@ class SignalProcessor:
         """
         symbol = symbol
         print(f"📊 Processing historical signals for {symbol} {timeframe}")
+        print(f"🔍 [DEBUG] DataFrame shape: {df.shape}, index_of_first_new_row: {index_of_first_new_row}")
         
+        # Check if we have data to process
+        if index_of_first_new_row >= len(df):
+            print(f"🔍 [DEBUG] No new data to process (index_of_first_new_row: {index_of_first_new_row}, df length: {len(df)})")
+            return []
+        
+        # Show the rows we're processing
+        rows_to_process = list(df.iterrows())[index_of_first_new_row:]
+        print(f"🔍 [DEBUG] Processing {len(rows_to_process)} rows from index {index_of_first_new_row}")
+        
+        trades_generated = []
 
-        for index, row in list(df.iterrows())[index_of_first_new_row:]:
+        for index, row in rows_to_process:
             try:
+                print(f"🔍 [DEBUG] Processing row {index}: {row.to_dict()}")
                 # Use process_latest_signal with save_to_csv=False and is_historical=True for efficiency
-                self.process_latest_signal(symbol, timeframe, row, is_historical=True)    
+                trade = self.process_latest_signal(symbol, timeframe, row, is_historical=True)
+                if trade:
+                    trades_generated.append(trade)
+                    print(f"🔍 [DEBUG] Generated trade: {trade.symbol} {trade.timeframe} at {trade.entry_price}")
             except Exception as e:
                 print(f"❌ Error processing latest signals for {symbol} {timeframe} at row {index}: {e}")
                 continue
                 
+        print(f"🔍 [DEBUG] Generated {len(trades_generated)} trades for {symbol} {timeframe}")
+        
         # Save all open trades to csv   
         self._save_trades_batch(is_open=True)
         # Save all closed trades to csv
         self._save_trades_batch(is_open=False)
+        
+        return trades_generated
 
     def process_latest_signal(self, symbol: str, timeframe: str, row: pd.Series, is_historical: bool = False) -> Optional[Trade]:
         """
@@ -380,6 +399,9 @@ class SignalProcessor:
             bool: True if buy signal conditions are met
         """
         try:
+            print(f"🔍 [DEBUG] _check_buy_signal called with debug={debug}")
+            print(f"🔍 [DEBUG] Row keys: {list(row.keys())}")
+            
             # Get indicator values (assuming standard column names)
             ema_col = 'ema' if 'ema' in row else None
             vwma_col = 'vwma' if 'vwma' in row else None 
@@ -415,6 +437,13 @@ class SignalProcessor:
             macd_line = row[macd_line_col]
             macd_signal = row[macd_signal_col]
             
+            print(f"🔍 [DEBUG] Raw indicator values:")
+            print(f"   EMA: {ema} (type: {type(ema)})")
+            print(f"   VWMA: {vwma} (type: {type(vwma)})")
+            print(f"   ROC: {roc} (type: {type(roc)})")
+            print(f"   MACD Line: {macd_line} (type: {type(macd_line)})")
+            print(f"   MACD Signal: {macd_signal} (type: {type(macd_signal)})")
+            
             # ENHANCED DEBUG: Check for NaN values
             if debug:
                 print(f"   [Buy Signal Debug] Indicator values:")
@@ -444,6 +473,13 @@ class SignalProcessor:
                 macd_line = float(macd_line) if macd_line is not None else None
                 macd_signal = float(macd_signal) if macd_signal is not None else None
                 
+                print(f"🔍 [DEBUG] Converted to float:")
+                print(f"   EMA: {ema}")
+                print(f"   VWMA: {vwma}")
+                print(f"   ROC: {roc}")
+                print(f"   MACD Line: {macd_line}")
+                print(f"   MACD Signal: {macd_signal}")
+                
                 # Double-check for None values after conversion
                 if any(x is None for x in [ema, vwma, roc, macd_line, macd_signal]):
                     if debug:
@@ -453,7 +489,8 @@ class SignalProcessor:
                 # At this point, all values are guaranteed to be float
                 assert ema is not None and vwma is not None and roc is not None and macd_line is not None and macd_signal is not None
                     
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                print(f"🔍 [DEBUG] Error converting to float: {e}")
                 if debug:
                     print(f"   [Buy Signal Debug] Non-numeric indicators - cannot check buy signal")
                 return False
@@ -471,6 +508,7 @@ class SignalProcessor:
                 print(f"     Condition 3 (MACD Line > MACD Signal): {macd_line} > {macd_signal} = {condition3}")
             
             result = condition1 and condition2 and condition3
+            print(f"🔍 [DEBUG] Buy signal result: {result}")
             if debug:
                 print(f"   [Buy Signal Debug] Final result: {result}")
             

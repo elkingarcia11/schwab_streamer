@@ -55,6 +55,10 @@ class IndicatorGenerator:
             bool: True if state was loaded successfully, False otherwise
         """
         try:
+            print(f"🔍 [DEBUG] load_state_from_dataframe for {symbol} {timeframe}")
+            print(f"🔍 [DEBUG] DataFrame shape: {df.shape}")
+            print(f"🔍 [DEBUG] DataFrame columns: {list(df.columns)}")
+            
             ema_period = self.periods[timeframe]['ema']
             vwma_period = self.periods[timeframe]['vwma']
             roc_period = self.periods[timeframe]['roc']
@@ -63,6 +67,7 @@ class IndicatorGenerator:
             signal_ema = self.periods[timeframe]['signal_ema']
 
             if len(df) == 0:
+                print(f"🔍 [DEBUG] DataFrame is empty")
                 return False
                 
             key = f"{symbol}_{timeframe}"
@@ -79,16 +84,22 @@ class IndicatorGenerator:
             
             # Get the last row
             last_row = df.iloc[-1]
+            print(f"🔍 [DEBUG] Last row data: {last_row.to_dict()}")
             
             # Track if all required fields were successfully loaded
             all_fields_loaded = True
             
             # Load EMA value if it exists
             if ema_period and 'ema' in df.columns:
-                last_values['ema'] = last_row['ema']
-                print(f"📊 Loaded EMA value: {last_values['ema']}")
+                ema_value = last_row['ema']
+                if not pd.isna(ema_value):
+                    last_values['ema'] = ema_value
+                    print(f"📊 Loaded EMA value: {last_values['ema']}")
+                else:
+                    print(f"📊 EMA value is NaN")
+                    all_fields_loaded = False
             else:
-                print(f"📊 No EMA value found")
+                print(f"📊 No EMA column found")
                 all_fields_loaded = False
                 
             # Load VWMA buffer - need to reconstruct from last few rows
@@ -97,11 +108,14 @@ class IndicatorGenerator:
                 last_n_rows = df.tail(vwma_period)
                 vwma_buffer = []
                 for _, row in last_n_rows.iterrows():
-                    vwma_buffer.append((row['close'], row['volume']))
+                    if not pd.isna(row['close']) and not pd.isna(row['volume']):
+                        vwma_buffer.append((row['close'], row['volume']))
                 last_values['vwma_buffer'] = vwma_buffer
                 print(f"📊 Loaded VWMA buffer with {len(vwma_buffer)} points")
+                if len(vwma_buffer) == 0:
+                    all_fields_loaded = False
             else:
-                print(f"📊 No VWMA value found")
+                print(f"📊 No VWMA column found")
                 all_fields_loaded = False
                 
             # Load ROC buffer - need to reconstruct from last roc_period rows
@@ -110,11 +124,14 @@ class IndicatorGenerator:
                 last_n_rows = df.tail(roc_period)
                 roc_buffer = []
                 for _, row in last_n_rows.iterrows():
-                    roc_buffer.append(row['close'])
+                    if not pd.isna(row['close']):
+                        roc_buffer.append(row['close'])
                 last_values['roc_buffer'] = roc_buffer
                 print(f"📊 Loaded ROC buffer with {len(roc_buffer)} close prices")
+                if len(roc_buffer) == 0:
+                    all_fields_loaded = False
             else:
-                print(f"📊 No ROC value found")
+                print(f"📊 No ROC period defined")
                 all_fields_loaded = False
                 
             # Load MACD values if they exist
@@ -123,19 +140,25 @@ class IndicatorGenerator:
                 macd_signal_col = 'macd_signal'
                 
                 if macd_line_col in df.columns and macd_signal_col in df.columns:
-                    last_values['macd_signal_ema'] = last_row[macd_signal_col]
-                    last_values['macd_fast_ema'] = last_row['close']  # Approximation
-                    last_values['macd_slow_ema'] = last_row['close']  # Approximation
-                    print(f"📊 Loaded MACD signal value: {last_values['macd_signal_ema']}")
+                    signal_value = last_row[macd_signal_col]
+                    if not pd.isna(signal_value):
+                        last_values['macd_signal_ema'] = signal_value
+                        last_values['macd_fast_ema'] = last_row['close']  # Approximation
+                        last_values['macd_slow_ema'] = last_row['close']  # Approximation
+                        print(f"📊 Loaded MACD signal value: {last_values['macd_signal_ema']}")
+                    else:
+                        print(f"📊 MACD signal value is NaN")
+                        all_fields_loaded = False
                 else:
-                    print(f"📊 No MACD values found")
+                    print(f"📊 No MACD columns found")
                     all_fields_loaded = False
             else:
-                print(f"📊 No MACD values found")
+                print(f"📊 No MACD periods defined")
                 all_fields_loaded = False
                 
             # Store the last values
             self.last_values[key] = last_values
+            print(f"🔍 [DEBUG] Stored last_values for {key}: {last_values}")
             
             if all_fields_loaded:
                 print(f"✅ Loaded existing state for {symbol} {timeframe}")
@@ -218,14 +241,25 @@ class IndicatorGenerator:
             slow_ema = self.periods[timeframe]['slow_ema']
             signal_ema = self.periods[timeframe]['signal_ema']
             
+            print(f"🔍 [DEBUG] Incremental calculation for {symbol} {timeframe}")
+            print(f"🔍 [DEBUG] New data points: {len(df)}")
+            print(f"🔍 [DEBUG] Stored buffers - VWMA: {len(last_vals.get('vwma_buffer', []))}, ROC: {len(last_vals.get('roc_buffer', []))}")
+            
             # Pre-allocate result DataFrame with original data
             result_df = df.copy()
             close_prices = df['close'].values
             volumes = df['volume'].values
             num_rows = len(close_prices)
             
-            # Calculate EMA incrementally (all new values)
-            if ema_period and last_vals['ema'] is not None:
+            # Initialize all indicator columns with NaN
+            result_df['ema'] = np.nan
+            result_df['vwma'] = np.nan
+            result_df['roc'] = np.nan
+            result_df['macd_line'] = np.nan
+            result_df['macd_signal'] = np.nan
+            
+            # Calculate EMA incrementally (only needs previous EMA value)
+            if ema_period and last_vals['ema'] is not None and not pd.isna(last_vals['ema']):
                 alpha = 2.0 / (ema_period + 1)
                 current_ema = last_vals['ema']
                 ema_values = np.zeros(num_rows)
@@ -236,9 +270,11 @@ class IndicatorGenerator:
                 
                 result_df['ema'] = ema_values
                 print(f"📊 Calculated incremental EMA for {num_rows} new rows")
+            else:
+                print(f"📊 Cannot calculate EMA - missing previous EMA value")
             
-            # Calculate VWMA incrementally (all new values)
-            if vwma_period and last_vals['vwma_buffer']:
+            # Calculate VWMA incrementally (needs buffer of previous prices/volumes)
+            if vwma_period and last_vals['vwma_buffer'] and len(last_vals['vwma_buffer']) > 0:
                 vwma_buffer = last_vals['vwma_buffer'].copy()
                 vwma_values = np.zeros(num_rows)
                 
@@ -248,8 +284,8 @@ class IndicatorGenerator:
                     if len(vwma_buffer) > vwma_period:
                         vwma_buffer.pop(0)
                     
-                    # Calculate VWMA for this point
-                    if len(vwma_buffer) == vwma_period:
+                    # Calculate VWMA for this point (use available data even if less than full period)
+                    if len(vwma_buffer) >= 2:  # Need at least 2 points for meaningful VWMA
                         prices = np.array([p for p, _ in vwma_buffer])
                         vols = np.array([v for _, v in vwma_buffer])
                         weighted_sum = np.sum(prices * vols)
@@ -262,9 +298,11 @@ class IndicatorGenerator:
                 
                 result_df['vwma'] = vwma_values
                 print(f"📊 Calculated incremental VWMA for {num_rows} new rows")
+            else:
+                print(f"📊 Cannot calculate VWMA - missing previous buffer")
             
-            # Calculate ROC incrementally (all new values)
-            if roc_period and last_vals['roc_buffer']:
+            # Calculate ROC incrementally (needs buffer of previous prices)
+            if roc_period and last_vals['roc_buffer'] and len(last_vals['roc_buffer']) > 0:
                 roc_buffer = last_vals['roc_buffer'].copy()
                 roc_values = np.zeros(num_rows)
                 
@@ -274,8 +312,8 @@ class IndicatorGenerator:
                     if len(roc_buffer) > roc_period + 1:
                         roc_buffer.pop(0)
                     
-                    # Calculate ROC for this point
-                    if len(roc_buffer) == roc_period + 1:
+                    # Calculate ROC for this point (use available data even if less than full period)
+                    if len(roc_buffer) >= 2:  # Need at least 2 points for ROC
                         current_price = roc_buffer[-1]
                         past_price = roc_buffer[0]
                         roc = (current_price - past_price) / past_price if past_price != 0 else 0
@@ -286,12 +324,17 @@ class IndicatorGenerator:
                 
                 result_df['roc'] = roc_values
                 print(f"📊 Calculated incremental ROC for {num_rows} new rows")
+            else:
+                print(f"📊 Cannot calculate ROC - missing previous buffer")
             
-            # Calculate MACD incrementally (all new values)
-            if fast_ema and slow_ema and signal_ema and last_vals['macd_signal_ema'] is not None:
-                # Initialize EMAs from last values
-                fast_ema_val = last_vals.get('macd_fast_ema', close_prices[0])
-                slow_ema_val = last_vals.get('macd_slow_ema', close_prices[0])
+            # Calculate MACD incrementally (needs previous EMA values)
+            if (fast_ema and slow_ema and signal_ema and 
+                last_vals['macd_signal_ema'] is not None and 
+                not pd.isna(last_vals['macd_signal_ema'])):
+                
+                # Initialize EMAs from last values or use current close as fallback
+                fast_ema_val = last_vals.get('macd_fast_ema', close_prices[0]) if last_vals.get('macd_fast_ema') is not None else close_prices[0]
+                slow_ema_val = last_vals.get('macd_slow_ema', close_prices[0]) if last_vals.get('macd_slow_ema') is not None else close_prices[0]
                 signal_ema_val = last_vals['macd_signal_ema']
                 
                 # Pre-calculate alpha values
@@ -318,13 +361,23 @@ class IndicatorGenerator:
                 result_df['macd_line'] = macd_line_values
                 result_df['macd_signal'] = macd_signal_values
                 print(f"📊 Calculated incremental MACD for {num_rows} new rows")
+            else:
+                print(f"📊 Cannot calculate MACD - missing previous signal EMA")
             
             print(f"✅ Incrementally processed {symbol} {timeframe} with {num_rows} new rows")
+            print(f"🔍 [DEBUG] Result indicators - EMA: {result_df['ema'].iloc[-1] if not pd.isna(result_df['ema'].iloc[-1]) else 'NaN'}, VWMA: {result_df['vwma'].iloc[-1] if not pd.isna(result_df['vwma'].iloc[-1]) else 'NaN'}, ROC: {result_df['roc'].iloc[-1] if not pd.isna(result_df['roc'].iloc[-1]) else 'NaN'}")
             return result_df
             
         except Exception as e:
             print(f"❌ Error in incremental processing {symbol} {timeframe}: {str(e)}")
-            return df
+            # Return DataFrame with NaN indicators as fallback
+            result_df = df.copy()
+            result_df['ema'] = np.nan
+            result_df['vwma'] = np.nan
+            result_df['roc'] = np.nan
+            result_df['macd_line'] = np.nan
+            result_df['macd_signal'] = np.nan
+            return result_df
 
     def _update_last_values_from_dataframe(self, symbol: str, timeframe: str, df: pd.DataFrame):
         """Update stored last_values with the latest values from the DataFrame."""
@@ -399,6 +452,21 @@ class IndicatorGenerator:
             fast_ema = self.periods[timeframe]['fast_ema']
             slow_ema = self.periods[timeframe]['slow_ema']
             signal_ema = self.periods[timeframe]['signal_ema']
+            
+            # Check if we have sufficient data for calculations
+            min_required_data = max(ema_period, vwma_period, roc_period + 1, fast_ema, slow_ema, signal_ema)
+            
+            if len(df) < min_required_data:
+                print(f"⚠️ Insufficient data for {symbol} {timeframe}: {len(df)} rows, need at least {min_required_data} rows")
+                print(f"   Required periods: EMA={ema_period}, VWMA={vwma_period}, ROC={roc_period}, Fast EMA={fast_ema}, Slow EMA={slow_ema}, Signal EMA={signal_ema}")
+                # Return DataFrame with NaN indicators
+                result_df = df.copy()
+                result_df['ema'] = np.nan
+                result_df['vwma'] = np.nan
+                result_df['roc'] = np.nan
+                result_df['macd_line'] = np.nan
+                result_df['macd_signal'] = np.nan
+                return result_df
             
             # Calculate all EMAs
             if ema_period:
