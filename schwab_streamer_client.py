@@ -136,7 +136,7 @@ class SchwabStreamerClient:
             print(f"✅ Market is already open (current time: {now_et.strftime('%H:%M:%S %Z')})")
         
         return True
-
+    
     def subscribe_chart_data(self, symbols: List[str]):
         """Subscribe to CHART_EQUITY data for the given symbols"""
         if not self.connected:
@@ -487,63 +487,51 @@ class SchwabStreamerClient:
         Process new candle data from streaming API
         """
         try:
-            print(f"🔍 [DEBUG] Starting process_new_candle for {symbol} {timeframe}")
-            print(f"🔍 [DEBUG] Input candle_data: {candle_data}")
-            
             # Convert timestamp from milliseconds to datetime
             timestamp_ms = candle_data['timestamp']
-            timestamp_dt = pd.Timestamp(timestamp_ms, unit='ms', tz='US/Eastern')
-            print(f"🔍 [DEBUG] Converted timestamp: {timestamp_ms} -> {timestamp_dt}")
+            try:
+                timestamp_dt = pd.Timestamp(timestamp_ms, unit='ms', tz='US/Eastern')
+                
+                # Validate timestamp conversion was successful
+                if pd.isna(timestamp_dt):
+                    print(f"❌ Invalid timestamp conversion for {symbol}: {timestamp_ms}")
+                    return
+            except Exception as e:
+                print(f"❌ Error converting timestamp {timestamp_ms}: {e}")
+                return
             
             # Filter out 1-minute data before 9:31 AM ET
             if timeframe == '1m':
-                # Get the time component (hour:minute)
                 try:
                     candle_time = timestamp_dt.time()
                     market_start_time = datetime.strptime('09:31', '%H:%M').time()
-                    
-                    print(f"🔍 [DEBUG] 1m filter check: {candle_time} < {market_start_time} = {candle_time < market_start_time}")
                     
                     if candle_time < market_start_time:
                         if self.debug:
                             print(f"⏰ Skipping 1m data before 9:31 AM: {timestamp_dt.strftime('%H:%M:%S %Z')} for {symbol}")
                         return
                 except (AttributeError, ValueError) as e:
-                    print(f"🔍 [DEBUG] Timestamp validation error: {e}")
                     if self.debug:
-                        print(f"⚠️ Invalid timestamp detected for {symbol}, skipping")
+                        print(f"⚠️ Invalid time component for {symbol}, skipping")
                     return
-            
-            # Skip processing if timestamp is invalid
-            try:
-                # Test if timestamp is valid by accessing a property
-                _ = timestamp_dt.strftime('%Y-%m-%d')
-                print(f"🔍 [DEBUG] Timestamp validation passed")
-            except (AttributeError, ValueError) as e:
-                print(f"🔍 [DEBUG] Timestamp validation failed: {e}")
-                if self.debug:
-                    print(f"⚠️ Invalid timestamp detected for {symbol}, skipping")
-                return
             
             # Create new row in the format expected by DataManager (matching CSV structure)
             new_row = pd.Series({
                 'timestamp': timestamp_ms,  # Keep original milliseconds format
-                'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),  # Safe to use now
+                'datetime': timestamp_dt.strftime('%Y-%m-%d %H:%M:%S %Z'),
                 'open': candle_data['open'],
                 'high': candle_data['high'],
                 'low': candle_data['low'],
                 'close': candle_data['close'],
                 'volume': candle_data['volume']
             })
-            print(f"🔍 [DEBUG] Created new_row: {new_row.to_dict()}")
                     
             # Fetch the DataFrame for the symbol and timeframe
             df = self.data_manager._get_dataframe(symbol, timeframe)
             df_inverse = self.data_manager._get_dataframe(f"{symbol}_inverse", timeframe)
-            print(f"🔍 [DEBUG] Retrieved DataFrames - df shape: {df.shape if df is not None else 'None'}, df_inverse shape: {df_inverse.shape if df_inverse is not None else 'None'}")
             
             # Initialize DataFrame if it doesn't exist
-            if df is None or df.empty:
+            if df is None or len(df) == 0:
                 print(f"📊 Initializing new DataFrame for {symbol} {timeframe}")
                 df = pd.DataFrame(columns=pd.Index(['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume']))
                 self.data_manager.latestDF[f"{symbol}_{timeframe}"] = df
@@ -551,49 +539,38 @@ class SchwabStreamerClient:
             # Check if this candle already exists (avoid duplicates)
             if len(df) > 0:
                 last_timestamp = df.iloc[-1]['timestamp']
-                print(f"🔍 [DEBUG] Last timestamp in df: {last_timestamp}, new timestamp: {timestamp_ms}")
                 # Check if the new row is within 30 seconds of the last row
                 if abs(new_row['timestamp'] - last_timestamp) < 30000:  # Within 30 seconds (30000 ms), likely duplicate
                     if self.debug:
                         print(f"🔄 Duplicate candle detected for {symbol}, skipping")
                     return
-            else:
-                print(f"🔍 [DEBUG] DataFrame is empty, no duplicate check needed")
             
             # Create a DataFrame with just the new row for indicator calculation
             new_row_df = pd.DataFrame([new_row])  # Convert Series to DataFrame
-            print(f"🔍 [DEBUG] Created new_row_df with shape: {new_row_df.shape}")
             
             # Calculate indicators for the new data ONLY, using existing DataFrame as context
-            print(f"🔍 [DEBUG] Calling calculate_real_time_indicators for {symbol} {timeframe}")
             result_df, index_of_first_new_row = self.data_manager.indicator_generator.calculate_real_time_indicators(symbol, timeframe, df, new_row_df)
-            print(f"🔍 [DEBUG] Indicators calculated, result_df shape: {result_df.shape}, index_of_first_new_row: {index_of_first_new_row}")
             
             # Check if indicators were calculated properly
             if len(result_df) > 0:
                 last_row = result_df.iloc[-1]
-                print(f"🔍 [DEBUG] Last row indicators - EMA: {last_row.get('ema', 'N/A')}, VWMA: {last_row.get('vwma', 'N/A')}, ROC: {last_row.get('roc', 'N/A')}, MACD Line: {last_row.get('macd_line', 'N/A')}, MACD Signal: {last_row.get('macd_signal', 'N/A')}")
-            else:
-                print(f"🔍 [DEBUG] No rows in result_df after indicator calculation")
+                if self.debug:
+                    print(f"📊 Last row indicators - EMA: {last_row.get('ema', 'N/A')}, VWMA: {last_row.get('vwma', 'N/A')}, ROC: {last_row.get('roc', 'N/A')}, MACD Line: {last_row.get('macd_line', 'N/A')}, MACD Signal: {last_row.get('macd_signal', 'N/A')}")
                     
             # Generate inverse data
             new_inverse_df = self.data_manager._generate_inverse_data(new_row_df)
-            print(f"🔍 [DEBUG] Generated inverse data, shape: {new_inverse_df.shape}")
 
             # Calculate indicators for inverse data
             result_inverse_df, index_of_first_new_row_inverse = self.data_manager.indicator_generator.calculate_real_time_indicators(
                 f"{symbol}_inverse", timeframe, df_inverse, new_inverse_df
             )
-            print(f"🔍 [DEBUG] Inverse indicators calculated, result_inverse_df shape: {result_inverse_df.shape}")
 
-            # Process signals (returns List of trades, not DataFrame)
-            print(f"🔍 [DEBUG] Calling process_signals for {symbol} {timeframe}")
-            self.data_manager.process_signals(symbol, timeframe, result_df, index_of_first_new_row)
+            # Process signals for original symbol
+            self.data_manager.process_signals(symbol, timeframe, result_df, index_of_first_new_row, is_streaming=True)
             print(f"✅ Processed signals for {symbol} {timeframe}")
 
             # Process trading signals for the inverse symbol
-            print(f"🔍 [DEBUG] Calling process_signals for {symbol}_inverse {timeframe}")
-            self.data_manager.process_signals(f"{symbol}_inverse", timeframe, result_inverse_df, index_of_first_new_row_inverse)
+            self.data_manager.process_signals(f"{symbol}_inverse", timeframe, result_inverse_df, index_of_first_new_row_inverse, is_streaming=True)
             print(f"✅ Processed signals for {symbol}_inverse {timeframe}")
                     
             # Save df to csv and update latest DataFrames
@@ -605,9 +582,8 @@ class SchwabStreamerClient:
 
             # Handle higher timeframe aggregation for 1m data
             if timeframe == '1m':
-                print(f"🔍 [DEBUG] Processing 1m candle, checking for higher timeframe aggregation")
                 self.add_to_candle_buffer(symbol, timeframe)
-            
+
         except Exception as e:
             print(f"❌ Error processing new candle for {symbol}: {e}")
             if self.debug:
@@ -672,93 +648,182 @@ class SchwabStreamerClient:
 
     def add_to_candle_buffer(self, symbol: str, timeframe: str):
         """
-        Add new candle to buffer and check if aggregation is needed.
+        Check if any higher timeframe intervals are complete and need aggregation.
         """
-        print(f"🔍 [DEBUG] add_to_candle_buffer called for {symbol} {timeframe}")
+        # Get the latest 1m candle timestamp
+        df_1m = self.data_manager._get_dataframe(symbol, '1m')
+        if df_1m is None or len(df_1m) == 0:
+            return
+            
+        latest_timestamp_ms = df_1m['timestamp'].iloc[-1]
+        try:
+            latest_dt = pd.Timestamp(latest_timestamp_ms, unit='ms', tz='US/Eastern')
+            if pd.isna(latest_dt):
+                print(f"❌ Invalid timestamp in 1m data for {symbol}")
+                return
+            current_minute = latest_dt.minute
+        except Exception as e:
+            print(f"❌ Error processing timestamp in add_to_candle_buffer: {e}")
+            return
         
-        # Initialize buffer if needed
-        if symbol not in self.candle_buffers:
-            print(f"🔍 [DEBUG] Initializing candle buffer for {symbol}")
-            self.initialize_candle_buffer(symbol)
-        
-        # Add to all timeframe buffers (skip 1m since we're processing a 1m candle)
+        # Check each higher timeframe to see if an interval is complete
         for tf in self.timeframes:
             if tf == '1m':  # Skip 1m timeframe
                 continue
                 
-            if tf not in self.candle_buffers[symbol]:
-                self.candle_buffers[symbol][tf] = 0
-            
-            # Increment buffer count
-            self.candle_buffers[symbol][tf] += 1
-            buffer_count = self.candle_buffers[symbol][tf]
-            
-            print(f"🔍 [DEBUG] {symbol} {tf} buffer count: {buffer_count}")
-            
-            # Check if we should aggregate
             timeframe_minutes = int(tf.replace('m', ''))
-            if buffer_count >= timeframe_minutes:
-                print(f"🔍 [DEBUG] Buffer full for {symbol} {tf}, triggering aggregation")
-                # Buffer is full - aggregate and clear
+            
+            # Check if we're at the end of an interval
+            # 1-minute candles: 9:30-9:31, 9:31-9:32, etc.
+            # 5-minute intervals: 9:30-9:35, 9:35-9:40, etc.
+            # 10-minute intervals: 9:30-9:40, 9:40-9:50, etc.
+            
+            # Calculate minutes since market open (9:30 AM)
+            market_open_minute = 30  # 9:30 AM
+            total_minutes = latest_dt.hour * 60 + latest_dt.minute
+            market_open_total = 9 * 60 + market_open_minute
+            minutes_since_open = total_minutes - market_open_total
+            
+            # Check if we're at the end of an interval (intervals complete at multiples of timeframe_minutes)
+            if self.debug:
+                print(f"🔍 {tf}: current_minute={current_minute}, minutes_since_open={minutes_since_open}, timeframe_minutes={timeframe_minutes}")
+                print(f"🔍 {tf}: Check condition: minutes_since_open > 0 = {minutes_since_open > 0}, minutes_since_open % timeframe_minutes = {minutes_since_open % timeframe_minutes}")
+                
+            if minutes_since_open > 0 and minutes_since_open % timeframe_minutes == 0:
+                if self.debug:
+                    print(f"📊 {tf} interval complete at minute {current_minute}, triggering aggregation")
+                
+                # Check if we already have a candle for this interval in the higher timeframe data
+                df_higher = self.data_manager._get_dataframe(symbol, tf)
+                if self.debug:
+                    print(f"🔍 {tf}: Checking existing data - df_higher is None: {df_higher is None}, df_higher length: {len(df_higher) if df_higher is not None else 'N/A'}")
+                    
+                if df_higher is not None and len(df_higher) > 0:
+                    # Calculate the expected timestamp for this interval
+                    interval_start_minute = (current_minute // timeframe_minutes) * timeframe_minutes
+                    interval_start_dt = latest_dt.replace(minute=interval_start_minute, second=0, microsecond=0)
+                    interval_end_dt = interval_start_dt + pd.Timedelta(minutes=timeframe_minutes)
+                    expected_timestamp_ms = int(interval_end_dt.timestamp() * 1000) - 1000
+                    
+                    # Check if this interval already exists
+                    if (df_higher['timestamp'] == expected_timestamp_ms).any():
+                        if self.debug:
+                            print(f"📊 {tf} candle for this interval already exists, skipping")
+                        continue
+                    else:
+                        if self.debug:
+                            print(f"🔍 {tf}: No existing candle found for timestamp {expected_timestamp_ms}, proceeding with aggregation")
+                else:
+                    if self.debug:
+                        print(f"🔍 {tf}: No existing higher timeframe data, proceeding with aggregation")
+                
+                # Aggregate the candles
+                if self.debug:
+                    print(f"🔍 {tf}: Calling aggregate_candles for {symbol}")
                 aggregated_candle = self.aggregate_candles(symbol, tf)
                 if aggregated_candle:
-                    print(f"🔍 [DEBUG] Processing aggregated candle for {symbol} {tf}")
+                    print(f"📊 Processing aggregated {tf} candle for {symbol}")
+                    if self.debug:
+                        print(f"🔍 Aggregated candle data: {aggregated_candle}")
                     self.process_new_candle(symbol, tf, aggregated_candle)
-                
-                # Clear buffer after aggregation
-                self.candle_buffers[symbol][tf] = 0
-                
-                if self.debug:
-                    print(f"✅ Aggregated {tf} candle for {symbol}, buffer cleared")
+                    
+                    if self.debug:
+                        print(f"✅ Aggregated {tf} candle for {symbol} processed successfully")
+                else:
+                    if self.debug:
+                        print(f"📊 No aggregated candle generated for {symbol} {tf}")
             else:
-                print(f"🔍 [DEBUG] {symbol} {tf} buffer not full yet ({buffer_count}/{timeframe_minutes})")
+                if self.debug:
+                    print(f"📊 {tf} interval not complete yet (minute {current_minute}, need minute ending with {timeframe_minutes-1})")
 
     def aggregate_candles(self, symbol: str, timeframe: str) -> dict:
         """Aggregate 1m candles into higher timeframe candle with proper time alignment"""
-        if symbol not in self.candle_buffers or not self.candle_buffers[symbol]:
+        if self.debug:
+            print(f"🔍 Checking aggregation for {symbol} {timeframe}")
+            
+        if symbol not in self.candle_buffers:
+            if self.debug:
+                print(f"📊 No candle buffers found for {symbol}")
+            return {}
+            
+        if not self.candle_buffers[symbol]:
+            if self.debug:
+                print(f"📊 Empty candle buffers for {symbol}")
             return {}
         
         # Get timeframe in minutes
         timeframe_minutes = int(timeframe.replace('m', ''))
-        
+
         df_1m = self.data_manager._get_dataframe(symbol, '1m')
-        if df_1m.empty:
+        if df_1m is None or len(df_1m) == 0:
+            if self.debug:
+                print(f"📊 No 1m data available for {symbol}")
             return {}
 
         # Get the latest timestamp from 1m data
         latest_timestamp_ms = df_1m['timestamp'].iloc[-1]
-        latest_dt = pd.Timestamp(latest_timestamp_ms, unit='ms', tz='US/Eastern')
+        try:
+            latest_dt = pd.Timestamp(latest_timestamp_ms, unit='ms', tz='US/Eastern')
+            if pd.isna(latest_dt):
+                print(f"❌ Invalid timestamp in 1m data for aggregation: {symbol}")
+                return {}
+        except Exception as e:
+            print(f"❌ Error processing timestamp in aggregate_candles: {e}")
+            return {}
         
-        # Calculate the proper interval start time
-        # For example, for 5m at 10:32, we want the interval 10:30-10:35
+        # Calculate the proper interval start time for the COMPLETED interval
+        # For example, for 5m at 10:35, we want the interval 10:30-10:35 (just completed)
+        # For 10m at 10:50, we want the interval 10:40-10:50 (just completed)
         minute = latest_dt.minute
-        interval_start_minute = (minute // timeframe_minutes) * timeframe_minutes
+        
+        # Calculate minutes since market open to align with market hours
+        market_open_minute = 30  # 9:30 AM
+        total_minutes = latest_dt.hour * 60 + latest_dt.minute
+        market_open_total = 9 * 60 + market_open_minute
+        minutes_since_open = total_minutes - market_open_total
+        
+        # Find the start of the completed interval
+        completed_intervals = minutes_since_open // timeframe_minutes
+        interval_start_minutes_since_open = (completed_intervals - 1) * timeframe_minutes
+        
+        # Convert back to actual time
+        interval_start_total_minutes = market_open_total + interval_start_minutes_since_open
+        interval_start_hour = interval_start_total_minutes // 60
+        interval_start_minute = interval_start_total_minutes % 60
         
         # Create the interval start datetime
-        interval_start_dt = latest_dt.replace(minute=interval_start_minute, second=0, microsecond=0)
-        interval_end_dt = interval_start_dt + pd.Timedelta(minutes=timeframe_minutes)
-        
-        # Convert back to milliseconds for filtering
-        interval_start_ms = int(interval_start_dt.timestamp() * 1000)
-        interval_end_ms = int(interval_end_dt.timestamp() * 1000)
-        
-        print(f"🔍 [DEBUG] Aggregating {symbol} {timeframe}")
-        print(f"🔍 [DEBUG] Latest 1m candle: {latest_dt.strftime('%H:%M:%S')}")
-        print(f"🔍 [DEBUG] Interval: {interval_start_dt.strftime('%H:%M:%S')} to {interval_end_dt.strftime('%H:%M:%S')}")
+        try:
+            interval_start_dt = latest_dt.replace(hour=int(interval_start_hour), minute=int(interval_start_minute), second=0, microsecond=0)
+            interval_end_dt = interval_start_dt + pd.Timedelta(minutes=timeframe_minutes)
+            
+            # Convert back to milliseconds for filtering
+            interval_start_ms = int(interval_start_dt.timestamp() * 1000)
+            interval_end_ms = int(interval_end_dt.timestamp() * 1000)
+        except Exception as e:
+            print(f"❌ Error calculating interval times: {e}")
+            return {}
+
+        if self.debug:
+            print(f"📊 Aggregating {symbol} {timeframe}")
+            print(f"📊 Latest 1m candle: {latest_dt.strftime('%H:%M:%S')}")
+            print(f"📊 Interval: {interval_start_dt.strftime('%H:%M:%S')} to {interval_end_dt.strftime('%H:%M:%S')}")
         
         # Filter 1m candles within this interval
         mask = (df_1m['timestamp'] >= interval_start_ms) & (df_1m['timestamp'] < interval_end_ms)
         interval_candles = df_1m[mask]
         
         if interval_candles.empty:
-            print(f"🔍 [DEBUG] No candles found in interval")
+            if self.debug:
+                print(f"📊 No candles found in interval")
             return {}
-        
-        print(f"🔍 [DEBUG] Found {len(interval_candles)} candles in interval")
+
+        if self.debug:
+            print(f"📊 Found {len(interval_candles)} candles in interval")
         
         # Check if we have enough candles for a complete interval
         if len(interval_candles) < timeframe_minutes:
-            print(f"🔍 [DEBUG] Incomplete interval: {len(interval_candles)}/{timeframe_minutes} candles")
+            if self.debug:
+                print(f"📊 Incomplete interval: {len(interval_candles)}/{timeframe_minutes} candles")
             return {}
 
         # Aggregate OHLCV data using the interval end time as timestamp
@@ -788,6 +853,10 @@ class SchwabStreamerClient:
                 print("✅ Daily trades email sent successfully")
             else:
                 print("❌ Failed to send daily trades email")
+                
+            # Flush any pending signal batches before disconnecting
+            print("📧 Flushing any pending signal batches...")
+            self.data_manager.signal_processor._send_all_pending_batches()
             
             # Disconnect the stream after sending email
             print("🔌 Disconnecting stream after daily email...")
@@ -806,13 +875,12 @@ if __name__ == "__main__":
         # Run bootstrap first to ensure all historical data is processed
         print("🚀 Running bootstrap to process historical data...")
         client.data_manager.bootstrap()
-        print("✅ Bootstrap completed, now checking market hours...")
+        print("✅ Bootstrap completed, now initializing candle buffers...")
         
-        # Initialize candle buffers for higher timeframe aggregation
-        print("🔄 Initializing candle buffers for higher timeframe aggregation...")
+        # Initialize candle buffers for all symbols after bootstrap
         for symbol in client.equity_symbols:
             client.initialize_candle_buffer(symbol)
-        print("✅ Candle buffers initialized")
+        print("✅ Candle buffers initialized, now checking market hours...")
         
         # Check if it's before market hours and wait until 9:30 AM if needed
         if not client.wait_for_market_open():

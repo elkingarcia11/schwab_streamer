@@ -143,30 +143,29 @@ class SignalProcessor:
     Processes trading signals and manages trade lifecycle.
     """
     def __init__(self, open_trades_csv_path: str = "data/open_trades.csv", closed_trades_csv_path: str = "data/closed_trades.csv"):
-        """
-        Initialize the SignalProcessor.
-        
-        Args:
-            trades_csv_path: Path to CSV file for storing trades
-        """
+        """Initialize the SignalProcessor with CSV file paths"""
         self.open_trades_csv_path = open_trades_csv_path
         self.closed_trades_csv_path = closed_trades_csv_path
-        # Mapping of (symbol, timeframe) to Trade object for open trades
         self.open_trades: Dict[str, Trade] = {}
         self.closed_trades: List[Trade] = []
-        
-        # Counter for periodic saving of open trades (to persist max unrealized values)
-        self.update_counter = 0
-        self.save_open_trades_interval = 1  # Save open trades every 50 updates
-        
-        # Initialize email manager
         self.email_manager = EmailManager()
-        
-        # Eastern Time zone for datetime operations
         self.et_tz = pytz.timezone('US/Eastern')
-
-        # Load existing trades from CSV
+        
+        # Signal batching for grouped emails
+        self.signal_batch = {
+            'buy': [],  # List of (trade, timestamp_minute) tuples
+            'sell': []  # List of (trade, timestamp_minute) tuples
+        }
+        self.last_batch_time = None
+        self.batch_timeout_seconds = 60  # Send batch after 60 seconds if no new signals
+        
+        # Create data directory if it doesn't exist
+        os.makedirs('data', exist_ok=True)
+        
+        # Load existing trades from CSV files
         self._load_trades_from_csv()
+        
+        print(f"📊 Loaded {len(self.open_trades)} open trades and {len(self.closed_trades)} closed trades")
         
     def _load_trades_from_csv(self):
         """Load open trades from CSV file"""
@@ -214,33 +213,26 @@ class SignalProcessor:
         """
         symbol = symbol
         print(f"📊 Processing historical signals for {symbol} {timeframe}")
-        print(f"🔍 [DEBUG] DataFrame shape: {df.shape}, index_of_first_new_row: {index_of_first_new_row}")
         
         # Check if we have data to process
         if index_of_first_new_row >= len(df):
-            print(f"🔍 [DEBUG] No new data to process (index_of_first_new_row: {index_of_first_new_row}, df length: {len(df)})")
             return []
         
         # Show the rows we're processing
         rows_to_process = list(df.iterrows())[index_of_first_new_row:]
-        print(f"🔍 [DEBUG] Processing {len(rows_to_process)} rows from index {index_of_first_new_row}")
         
         trades_generated = []
 
         for index, row in rows_to_process:
             try:
-                print(f"🔍 [DEBUG] Processing row {index}: {row.to_dict()}")
                 # Use process_latest_signal with save_to_csv=False and is_historical=True for efficiency
                 trade = self.process_latest_signal(symbol, timeframe, row, is_historical=True)
                 if trade:
                     trades_generated.append(trade)
-                    print(f"🔍 [DEBUG] Generated trade: {trade.symbol} {trade.timeframe} at {trade.entry_price}")
             except Exception as e:
                 print(f"❌ Error processing latest signals for {symbol} {timeframe} at row {index}: {e}")
                 continue
                 
-        print(f"🔍 [DEBUG] Generated {len(trades_generated)} trades for {symbol} {timeframe}")
-        
         # Save all open trades to csv   
         self._save_trades_batch(is_open=True)
         # Save all closed trades to csv
@@ -399,8 +391,9 @@ class SignalProcessor:
             bool: True if buy signal conditions are met
         """
         try:
-            print(f"🔍 [DEBUG] _check_buy_signal called with debug={debug}")
-            print(f"🔍 [DEBUG] Row keys: {list(row.keys())}")
+            if debug:
+                print(f"🔍 [DEBUG] _check_buy_signal called with debug={debug}")
+                print(f"🔍 [DEBUG] Row keys: {list(row.keys())}")
             
             # Get indicator values (assuming standard column names)
             ema_col = 'ema' if 'ema' in row else None
@@ -508,8 +501,8 @@ class SignalProcessor:
                 print(f"     Condition 3 (MACD Line > MACD Signal): {macd_line} > {macd_signal} = {condition3}")
             
             result = condition1 and condition2 and condition3
-            print(f"🔍 [DEBUG] Buy signal result: {result}")
             if debug:
+                print(f"🔍 [DEBUG] Buy signal result: {result}")
                 print(f"   [Buy Signal Debug] Final result: {result}")
             
             return result
@@ -856,10 +849,22 @@ class SignalProcessor:
 
 ⚠️ Disclaimer: This is automated analysis, not financial advice.
 """
-            # Send email
+            # Send email with closed trades CSV attachment
             if subject is None:
                 subject = "Trade Summary"  # Provide default subject if None
-            return self.email_manager._send_email(subject, body)
+            
+            # Attach closed trades CSV file if it exists
+            attachment_path = None
+            if os.path.exists(self.closed_trades_csv_path):
+                attachment_path = self.closed_trades_csv_path
+                body += f"""
+
+📎 ATTACHMENT:
+• Closed Trades CSV: {os.path.basename(self.closed_trades_csv_path)}
+  Complete detailed trade history attached for your records.
+"""
+            
+            return self.email_manager._send_email(subject, body, attachment_path)
             
         except Exception as e:
             print(f"❌ Error sending trade summary email: {e}")
@@ -890,7 +895,27 @@ class SignalProcessor:
         return self.email_trade_summary(subject=subject, include_open_trades=True)
 
     def _send_buy_email(self, trade: Trade):
-        """Send email notification for buy signal"""
+        """Send email notification for buy signal (uses batching system)"""
+        # Add to batch instead of sending immediately
+        self._add_to_batch('buy', trade)
+            
+    def _send_sell_email(self, trade: Trade):
+        """Send email notification for sell signal (uses batching system)"""
+        # Add to batch instead of sending immediately  
+        self._add_to_batch('sell', trade)
+
+    def _add_to_batch(self, action: str, trade: Trade):
+        """Add a trade to the signal batch for grouped email sending"""
+        timestamp = trade.entry_time if action == 'buy' else (trade.exit_time or datetime.now(self.et_tz))
+        minute_key = self._get_minute_key(timestamp)
+        self.signal_batch[action].append((trade, minute_key))
+        self.last_batch_time = datetime.now()
+        
+        # Check if we should send the batch immediately (multiple signals in same minute)
+        self._check_and_send_batch(action, minute_key)
+
+    def _send_individual_buy_email(self, trade: Trade):
+        """Send individual buy email (fallback for single signals)"""
         try:
             signal_details = {
                 'price': trade.entry_price,
@@ -907,10 +932,10 @@ class SignalProcessor:
             )
             
         except Exception as e:
-            print(f"❌ Error sending buy email: {e}")
+            print(f"❌ Error sending individual buy email: {e}")
             
-    def _send_sell_email(self, trade: Trade):
-        """Send email notification for sell signal"""
+    def _send_individual_sell_email(self, trade: Trade):
+        """Send individual sell email (fallback for single signals)"""
         try:
             # Calculate trade duration in seconds
             trade_duration_seconds = trade.trade_duration.total_seconds() if trade.trade_duration else 0
@@ -919,7 +944,7 @@ class SignalProcessor:
                 'price': trade.exit_price,
                 'entry_price': trade.entry_price,
                 'entry_time': trade.entry_time.strftime('%Y-%m-%d %H:%M:%S %Z'),
-                'sell_time': trade.exit_time.strftime('%Y-%m-%d %H:%M:%S %Z') if trade.exit_time else 'Unknown',
+                'sell_time': (trade.exit_time or datetime.now(self.et_tz)).strftime('%Y-%m-%d %H:%M:%S %Z'),
                 'realized_pnl_percent': trade.pnl_percent,
                 'hold_duration': str(trade.trade_duration) if trade.trade_duration else 'Unknown',
                 'conditions_met': 1,  # 2+ conditions failed for sell
@@ -939,124 +964,122 @@ class SignalProcessor:
             )
             
         except Exception as e:
-            print(f"❌ Error sending sell email: {e}")
+            print(f"❌ Error sending individual sell email: {e}")
 
-
-
-    def email_trade_summary_by_symbol_timeframe(self, symbol: str, timeframe: str, 
-                                              subject: Optional[str] = None, include_open_trades: bool = True) -> bool:
-        """
-        Send a comprehensive trade summary email for a specific symbol and timeframe.
+    def _check_and_send_batch(self, action: str, current_minute_key: str):
+        """Check if we should send a batch of signals and send if criteria are met"""
+        # Count signals in the current minute
+        current_minute_signals = [
+            (trade, minute_key) for trade, minute_key in self.signal_batch[action] 
+            if minute_key == current_minute_key
+        ]
         
-        Args:
-            symbol: Trading symbol (e.g., 'SPY')
-            timeframe: Timeframe (e.g., '5m')
-            subject: Custom email subject (optional)
-            include_open_trades: Whether to include current open trades in the email
+        # Send immediately if we have multiple signals in the same minute
+        if len(current_minute_signals) >= 2:
+            self._send_batched_signals(action, current_minute_key)
+        # Or if it's been more than batch_timeout_seconds since last signal
+        elif (self.last_batch_time and 
+              (datetime.now() - self.last_batch_time).total_seconds() > self.batch_timeout_seconds):
+            self._send_all_pending_batches()
+    
+    def _send_batched_signals(self, action: str, minute_key: str):
+        """Send a batch of signals for a specific minute"""
+        # Get all signals for this minute
+        minute_signals = [
+            (trade, mk) for trade, mk in self.signal_batch[action] 
+            if mk == minute_key
+        ]
+        
+        if not minute_signals:
+            return
             
-        Returns:
-            bool: True if email sent successfully, False otherwise
-        """
-        try:
-            symbol = symbol
-            
-            # Get trade summary for this specific symbol-timeframe
-            summary = self.get_trade_summary_by_symbol_timeframe(symbol, timeframe)
-            
-            if not subject:
-                subject = f"Trade Summary: {symbol} {timeframe} - {summary['total_trades']} Trades, {summary['win_rate']:.1f}% Win Rate"
-            
-            # Build email body
-            body = f"""
-📊 TRADE SUMMARY REPORT: {symbol} {timeframe}
+        trades = [trade for trade, _ in minute_signals]
+        
+        # Group by timeframe for better organization
+        timeframe_groups = {}
+        for trade in trades:
+            tf = trade.timeframe
+            if tf not in timeframe_groups:
+                timeframe_groups[tf] = []
+            timeframe_groups[tf].append(trade)
+        
+        # Create subject with symbols
+        symbols = [trade.symbol for trade in trades]
+        unique_symbols = list(dict.fromkeys(symbols))  # Preserve order, remove duplicates
+        subject = f"{action.upper()} {', '.join(unique_symbols)}"
+        
+        # Create email body
+        body = f"""🚨 {action.upper()} SIGNALS - {minute_key}
 {'=' * 50}
 
-📈 PERFORMANCE METRICS:
-• Total Trades: {summary['total_trades']}
-• Winning Trades: {summary['winning_trades']}
-• Losing Trades: {summary['losing_trades']}
-• Win Rate: {summary['win_rate']:.1f}%
-
-💰 PROFIT & LOSS:
-• Total P&L: ${summary['total_pnl']:.2f}
-• Average P&L: ${summary['avg_pnl']:.2f}
-• Average Win: ${summary['avg_win']:.2f}
-• Average Loss: ${summary['avg_loss']:.2f}
-• Best Trade: ${summary['max_win']:.2f}
-• Worst Trade: ${summary['max_loss']:.2f}
-
-⏱️ TRADE DURATION:
-• Average Duration: {summary['avg_trade_duration_hours']:.2f} hours
-
+📊 MULTIPLE {action.upper()} SIGNALS DETECTED:
 """
-            
-            # Add open trades section if requested and trades exist
-            if include_open_trades and summary['open_trades_count'] > 0:
-                body += f"""
-🔄 CURRENT OPEN TRADES: {summary['open_trades_count']}
-• Current P&L: ${summary['open_trades_pnl']:.2f} ({(summary['open_trades_pnl']/100)*100:.2f}%)
-• Max Unrealized Gain: ${summary['current_unrealized_gain']:.2f}
-• Max Unrealized Loss: ${summary['current_unrealized_loss']:.2f}
-
-"""
-            
-            # Add detailed trade history if there are trades
-            if summary['total_trades'] > 0:
-                body += f"""
-📋 DETAILED TRADE HISTORY:
-{'=' * 30}
-
-"""
-                # Get all trades for this symbol-timeframe
-                symbol_trades = [trade for trade in self.closed_trades 
-                               if trade.symbol == symbol and trade.timeframe == timeframe]
+        
+        total_value = 0
+        for timeframe, tf_trades in timeframe_groups.items():
+            body += f"\n📈 {timeframe} TIMEFRAME:\n"
+            for trade in tf_trades:
+                price = trade.entry_price if action == 'buy' else trade.exit_price
+                total_value += price
                 
-                # Sort by entry time (ensure timezone consistency)
-                et_tz = pytz.timezone('US/Eastern')
-                def get_entry_time_for_sorting(trade):
-                    entry_time = trade.entry_time
-                    if entry_time.tzinfo is None:
-                        # If timezone-naive, assume Eastern Time
-                        entry_time = et_tz.localize(entry_time)
-                    return entry_time
-                
-                symbol_trades.sort(key=get_entry_time_for_sorting)
-                
-                for i, trade in enumerate(symbol_trades[-10:], 1):  # Show last 10 trades
-                    status = "🔄 OPEN" if trade.exit_time is None else "✅ CLOSED"
-                    entry_time = trade.entry_time.strftime('%Y-%m-%d %H:%M')
-                    
-                    if trade.exit_time is None:
-                        body += f"{i:2d}. {status} | Entry: {entry_time} @ ${trade.entry_price:.2f} | Current P&L: ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%)\n"
-                    else:
-                        # Handle case where exit_time could be None
-                        exit_time = trade.exit_time.strftime('%Y-%m-%d %H:%M') if trade.exit_time else 'N/A'
-                        duration_hours = trade.trade_duration.total_seconds() / 3600 if trade.trade_duration else 0
-                        profit_indicator = "📈" if trade.pnl > 0 else "📉"
-                        body += f"{i:2d}. {status} | {entry_time} → {exit_time} | ${trade.entry_price:.2f} → ${trade.exit_price:.2f} | {profit_indicator} ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%) | {duration_hours:.1f}h\n"
-                if len(symbol_trades) > 10:
-                    body += f"\n... and {len(symbol_trades) - 10} more trades\n"
-            
-            body += f"""
-
-📧 Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-🤖 Automated Trading System
-"""
-            
-            # Send email
-            email_manager = EmailManager()
-            success = email_manager._send_email(subject, body)
-            
+                if action == 'buy':
+                    body += f"• {trade.symbol} @ ${price:.2f}\n"
+                else:
+                    pnl_indicator = "📈" if trade.pnl > 0 else "📉"
+                    body += f"• {trade.symbol} @ ${price:.2f} | {pnl_indicator} P&L: ${trade.pnl:.2f} ({trade.pnl_percent:.2f}%)\n"
+        
+        if action == 'buy':
+            body += f"\n💰 Total Entry Value: ${total_value:.2f}"
+            body += f"\n🎯 All positions opened simultaneously"
+        else:
+            total_pnl = sum(trade.pnl for trade in trades)
+            total_pnl_percent = sum(trade.pnl_percent for trade in trades) / len(trades)
+            body += f"\n💰 Total Exit Value: ${total_value:.2f}"
+            body += f"\n📊 Combined P&L: ${total_pnl:.2f} ({total_pnl_percent:.2f}% avg)"
+        
+        body += f"\n\n📧 Batch sent at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        body += f"\n🤖 Automated Trading System"
+        
+        # Send the batched email
+        try:
+            success = self.email_manager._send_email(subject, body)
             if success:
-                print(f"✅ Trade summary email sent for {symbol} {timeframe}")
+                print(f"✅ Sent batched {action} email for {len(trades)} trades: {', '.join(unique_symbols)}")
             else:
-                print(f"❌ Failed to send trade summary email for {symbol} {timeframe}")
-                
-            return success
-            
+                print(f"❌ Failed to send batched {action} email")
         except Exception as e:
-            print(f"❌ Failed to send trade summary email for {symbol} {timeframe}: {str(e)}")
-            return False
+            print(f"❌ Error sending batched {action} email: {e}")
+        
+        # Remove sent signals from batch
+        self.signal_batch[action] = [
+            (trade, mk) for trade, mk in self.signal_batch[action] 
+            if mk != minute_key
+        ]
+    
+    def _send_all_pending_batches(self):
+        """Send all pending batches (called on timeout or shutdown)"""
+        # Group remaining signals by minute and send
+        for action in ['buy', 'sell']:
+            minute_groups = {}
+            for trade, minute_key in self.signal_batch[action]:
+                if minute_key not in minute_groups:
+                    minute_groups[minute_key] = []
+                minute_groups[minute_key].append(trade)
+            
+            for minute_key, trades in minute_groups.items():
+                if len(trades) == 1:
+                    # Send individual email for single signals
+                    trade = trades[0]
+                    if action == 'buy':
+                        self._send_individual_buy_email(trade)
+                    else:
+                        self._send_individual_sell_email(trade)
+                else:
+                    # Send batched email for multiple signals
+                    self._send_batched_signals(action, minute_key)
+        
+        # Clear all batches
+        self.signal_batch = {'buy': [], 'sell': []}
 
     def has_processed_signals(self, symbol: str, timeframe: str) -> bool:
         """
@@ -1111,3 +1134,7 @@ class SignalProcessor:
                 
         except Exception as e:
             print(f"❌ Error saving new trade to CSV: {e}")
+
+    def _get_minute_key(self, timestamp: datetime) -> str:
+        """Get minute-level key for batching signals (YYYY-MM-DD HH:MM)"""
+        return timestamp.strftime('%Y-%m-%d %H:%M')

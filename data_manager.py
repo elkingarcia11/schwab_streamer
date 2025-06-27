@@ -119,6 +119,10 @@ class DataManager:
         success_rate = (total_success / total_tasks) * 100 if total_tasks > 0 else 0
         print(f"\n🎯 Success Rate: {total_success}/{total_tasks} ({success_rate:.1f}%)")
         
+        # Flush any pending signal batches from bootstrap processing
+        print("\n📧 Flushing any pending signal batches...")
+        self.signal_processor._send_all_pending_batches()
+        
         # Send email with open trades data after all signals are processed
         print("\n📧 Sending open trades email after bootstrap completion...")
         try:
@@ -275,131 +279,147 @@ class DataManager:
             timeframe: Timeframe (e.g., '1m', '5m', '10m', '15m', '30m')
             
         Returns:
-            Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]: Tuple containing original data and new data for the symbol and inverse symbol
+            Optional[pd.DataFrame]: New data fetched for the symbol, or None if no new data
         """
         df_key = f"{symbol}_{timeframe}"
         interval_minutes = self._extract_frequency_number(timeframe)
         
         print(f"🔄 Fetching base symbol data for {symbol} {timeframe}")
         
-        # Check if DataFrame exists in memory
+        # Check if DataFrame exists in memory (incremental fetch)
         if df_key in self.latestDF and len(self.latestDF[df_key]) > 0:
-            original_df = self.latestDF[df_key]
-            # Get the last timestamp from existing data
-            last_timestamp = original_df['timestamp'].max()
+            return self._fetch_incremental_data(symbol, timeframe, interval_minutes)
+        else:
+            # Perform initial historical fetch
+            return self._fetch_initial_data(symbol, timeframe, interval_minutes)
+    
+    def _fetch_incremental_data(self, symbol: str, timeframe: str, interval_minutes: int) -> Optional[pd.DataFrame]:
+        """Fetch incremental data for existing symbol/timeframe"""
+        df_key = f"{symbol}_{timeframe}"
+        original_df = self.latestDF[df_key]
+        
+        # Get the last timestamp from existing data
+        last_timestamp = int(original_df['timestamp'].max())
+        try:
             # Convert last timestamp to datetime in UTC and then to ET
             last_datetime_utc = datetime.fromtimestamp(last_timestamp / 1000, tz=pytz.UTC)
             last_datetime_et = last_datetime_utc.astimezone(self.et_tz)
+        except Exception as e:
+            print(f"❌ Error converting last timestamp for {symbol} {timeframe}: {e}")
+            return None
+        
+        # For 1m data, ensure we don't fetch before today's market open
+        if timeframe == '1m':
+            market_open_today = self._get_market_open_today()
+            if last_datetime_et < market_open_today:
+                last_datetime_et = market_open_today
+                print(f"📊 Adjusting start time to today's market open: {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        
+        # Get end time for fetch
+        end_date = self._get_last_completed_timestamp()
+        
+        # Check if we need to fetch data
+        if last_datetime_et >= end_date:
+            print(f"📊 Data is already up to date for {symbol} {timeframe}")
+            return None
+        
+        # Handle overnight gaps for non-1m timeframes
+        if timeframe != '1m':
+            return self._handle_overnight_gap(symbol, timeframe, last_datetime_et, end_date, interval_minutes, last_timestamp)
+        else:
+            # For 1m data, simple incremental fetch
+            return self._simple_incremental_fetch(symbol, timeframe, last_datetime_et, end_date, interval_minutes, last_timestamp)
+    
+    def _handle_overnight_gap(self, symbol: str, timeframe: str, last_datetime_et: datetime, 
+                             end_date: datetime, interval_minutes: int, last_timestamp: int) -> Optional[pd.DataFrame]:
+        """Handle overnight gaps for non-1m timeframes"""
+        last_date = last_datetime_et.date()
+        end_date_obj = end_date.date()
+        
+        if last_date < end_date_obj:
+            # Gap crosses overnight - fetch yesterday's data first
+            yesterday_close = datetime.combine(last_date, self.market_close)
+            yesterday_close = self.et_tz.localize(yesterday_close)
             
-            # For 1m data, ensure we don't fetch before today's market open
-            if timeframe == '1m':
-                market_open_today = self._get_market_open_today()
-                if last_datetime_et < market_open_today:
-                    last_datetime_et = market_open_today
-                    print(f"📊 Adjusting start time to today's market open: {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                
-            # Fetch new data from last timestamp to current time
-            end_date = self._get_last_completed_timestamp()
-            
-            # Ensure we're not trying to fetch outside market hours
-            if last_datetime_et < end_date:
-                # For non-1m timeframes, check if the gap crosses market hours boundaries
-                if timeframe != '1m':
-                    # If the gap crosses overnight, we need to handle it properly
-                    last_date = last_datetime_et.date()
-                    end_date_obj = end_date.date()
-                    
-                    if last_date < end_date_obj:
-                        # Gap crosses overnight - we should only fetch up to yesterday's market close
-                        # and then separately fetch from today's market open
-                        yesterday_close = datetime.combine(last_date, self.market_close)
-                        yesterday_close = self.et_tz.localize(yesterday_close)
-                        
-                        if last_datetime_et < yesterday_close:
-                            print(f"📡 Fetching data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {yesterday_close.strftime('%Y-%m-%d %H:%M:%S %Z')} (yesterday's close)")
-                            new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, yesterday_close, interval_minutes)
-                            
-                            if new_df is not None and len(new_df) > 0:
-                                # Filter out data that might overlap with existing data
-                                new_df = new_df[new_df['timestamp'] > last_timestamp]
-                                
-                                if len(new_df) > 0:
-                                    print(f"📈 Processing {len(new_df)} new records from yesterday")
-                                    if isinstance(new_df, pd.Series):
-                                        new_df = new_df.to_frame().T
-                                    return new_df
-                        
-                        # Now check if we should fetch today's data
-                        today_open = self._get_market_open_today()
-                        if end_date > today_open:
-                            print(f"📡 Fetching data from {today_open.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')} (today's market hours)")
-                            today_df = self._fetch_data_from_schwab(symbol, today_open, end_date, interval_minutes)
-                            
-                            if today_df is not None and len(today_df) > 0:
-                                print(f"📈 Processing {len(today_df)} new records from today")
-                                if isinstance(today_df, pd.Series):
-                                    today_df = today_df.to_frame().T
-                                return today_df
-                        
-                        print(f"📊 No new data available for {symbol} {timeframe}")
-                        return None
-                    else:
-                        # Same day fetch
-                        print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                        new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
-                else:
-                    # For 1m data, just fetch the gap
-                    print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
+            if last_datetime_et < yesterday_close:
+                print(f"📡 Fetching data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {yesterday_close.strftime('%Y-%m-%d %H:%M:%S %Z')} (yesterday's close)")
+                new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, yesterday_close, interval_minutes)
                 
                 if new_df is not None and len(new_df) > 0:
-                    # Filter out data that might overlap with existing data
+                    # Filter out overlapping data
                     new_df = new_df[new_df['timestamp'] > last_timestamp]
-                    
                     if len(new_df) > 0:
-                        print(f"📈 Processing {len(new_df)} new records incrementally")
-                        # Ensure new_df is a DataFrame, not a Series
-                        if isinstance(new_df, pd.Series):
-                            new_df = new_df.to_frame().T
-                        return new_df
-                    else:
-                        print(f"📊 No new data available for {symbol} {timeframe}")
-                        return None
-                else:
-                    print(f"📊 No new data fetched for {symbol} {timeframe}")
-                    return None
+                        print(f"📈 Processing {len(new_df)} new records from yesterday")
+                        return self._ensure_dataframe(new_df)
+            
+            # Check if we should fetch today's data
+            today_open = self._get_market_open_today()
+            if end_date > today_open:
+                print(f"📡 Fetching data from {today_open.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')} (today's market hours)")
+                today_df = self._fetch_data_from_schwab(symbol, today_open, end_date, interval_minutes)
+                
+                if today_df is not None and len(today_df) > 0:
+                    print(f"📈 Processing {len(today_df)} new records from today")
+                    return self._ensure_dataframe(today_df)
+            
+            print(f"📊 No new data available for {symbol} {timeframe}")
+            return None
+        else:
+            # Same day fetch
+            return self._simple_incremental_fetch(symbol, timeframe, last_datetime_et, end_date, interval_minutes, last_timestamp)
+    
+    def _simple_incremental_fetch(self, symbol: str, timeframe: str, last_datetime_et: datetime, 
+                                 end_date: datetime, interval_minutes: int, last_timestamp: int) -> Optional[pd.DataFrame]:
+        """Perform simple incremental fetch for same-day data"""
+        print(f"📡 Fetching new data from {last_datetime_et.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        new_df = self._fetch_data_from_schwab(symbol, last_datetime_et, end_date, interval_minutes)
+        
+        if new_df is not None and len(new_df) > 0:
+            # Filter out data that might overlap with existing data
+            new_df = new_df[new_df['timestamp'] > last_timestamp]
+            
+            if len(new_df) > 0:
+                print(f"📈 Processing {len(new_df)} new records incrementally")
+                return self._ensure_dataframe(new_df)
             else:
-                print(f"📊 Data is already up to date for {symbol} {timeframe}")
+                print(f"📊 No new data available for {symbol} {timeframe}")
                 return None
         else:
-            # Perform initial historical fetch
-            # No existing data, use default start dates based on timeframe
-            end_date = self._get_last_completed_timestamp()
-            
-            if timeframe == '1m':
-                # For 1m: check if we're outside market hours
-                now_et = datetime.now(self.et_tz)
-                current_time = now_et.time()
-                
-                # IF before market hours return, if after market hours return today's market open and market close
-                if current_time < self.market_open or current_time > self.market_close:
-                    print(f"📊 Before market hours, returning None for {symbol} {timeframe}")
-                    return None
-                else:
-                    # During market hours, use today's market open
-                    start_date = self._get_market_open_today()
-                    end_date = self._get_last_completed_timestamp()
-            else:
-                # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
-                start_date = self.et_tz.localize(datetime(2025, 1, 1))
-                print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                end_date = self._get_last_completed_timestamp()
-            
-            print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
-            
-            return df
+            print(f"📊 No new data fetched for {symbol} {timeframe}")
+            return None
     
+    def _fetch_initial_data(self, symbol: str, timeframe: str, interval_minutes: int) -> Optional[pd.DataFrame]:
+        """Fetch initial historical data for new symbol/timeframe"""
+        end_date = self._get_last_completed_timestamp()
+        
+        if timeframe == '1m':
+            # For 1m: check if we're outside market hours
+            now_et = datetime.now(self.et_tz)
+            current_time = now_et.time()
+            
+            if current_time < self.market_open or current_time > self.market_close:
+                print(f"📊 Outside market hours, returning None for {symbol} {timeframe}")
+                return None
+            else:
+                # During market hours, use today's market open (9:30 AM)
+                start_date = self._get_market_open_today()
+                end_date = self._get_last_completed_timestamp()
+        else:
+            # For 5m, 10m, 15m, 30m: fetch from January 1, 2025 to last completed timestamp
+            start_date = self.et_tz.localize(datetime(2025, 1, 1))
+            print(f"📊 No existing data found, using default start date: {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        
+        print(f"📡 Initial fetch for {symbol} {timeframe} from {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        df = self._fetch_data_from_schwab(symbol, start_date, end_date, interval_minutes)
+        
+        return df
+    
+    def _ensure_dataframe(self, data) -> pd.DataFrame:
+        """Ensure data is returned as DataFrame, not Series"""
+        if isinstance(data, pd.Series):
+            return data.to_frame().T
+        return data
+
     def _get_dataframe(self, symbol: str, timeframe: str):
         """Fetch the latest DataFrame for a given symbol and timeframe"""
         df = self.latestDF[f"{symbol}_{timeframe}"]
@@ -426,7 +446,7 @@ class DataManager:
         return new_inverse_df
 
 
-    def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, index_of_first_new_row: int) -> List:
+    def process_signals(self, symbol: str, timeframe: str, df: pd.DataFrame, index_of_first_new_row: int, is_streaming: bool = False) -> List:
         """
         Process trading signals for a DataFrame
         
@@ -434,19 +454,31 @@ class DataManager:
             symbol: Stock symbol
             timeframe: Timeframe
             df: DataFrame with OHLCV data and indicators
+            index_of_first_new_row: Index of first new row to process
+            is_streaming: Whether this is streaming data (True) or bootstrap data (False)
             
         Returns:
             List of trades generated
         """
-        print(f"🔍 [DEBUG] process_signals called for {symbol} {timeframe}")
-        print(f"🔍 [DEBUG] DataFrame shape: {df.shape}, index_of_first_new_row: {index_of_first_new_row}")
-        
-        if len(df) > 0:
-            print(f"🔍 [DEBUG] Last row data: {df.iloc[-1].to_dict()}")
-        
-        result = self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
-        print(f"🔍 [DEBUG] process_historical_signals returned: {len(result) if result else 0} trades")
-        return result
+        if is_streaming:
+            # For streaming, process only the last row as latest signal (with emails)
+            if len(df) > 0:
+                last_row = df.iloc[-1]
+                print(f"📊 Processing streaming signal for {symbol} {timeframe}")
+                trade = self.signal_processor.process_latest_signal(symbol, timeframe, last_row, is_historical=False)
+                if trade:
+                    print(f"✅ Generated trade: {trade.symbol} {trade.timeframe} at {trade.entry_price}")
+                    return [trade]
+                else:
+                    print(f"📊 No trade signal detected for {symbol} {timeframe}")
+                    return []
+            else:
+                print(f"❌ No data available for streaming signal processing")
+                return []
+        else:
+            # For bootstrap, process historical data (without emails)
+            result = self.signal_processor.process_historical_signals(symbol, timeframe, df, index_of_first_new_row)
+            return result
         
     def save_df_to_csv(self, df: pd.DataFrame, symbol: str, timeframe: str):
         """Save DataFrame to CSV file"""

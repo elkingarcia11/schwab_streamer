@@ -7,6 +7,8 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from typing import Dict, Optional
 import time
 
@@ -224,13 +226,14 @@ Trading Logic: Open when ALL 3 conditions met, Close when ≤1 condition remains
             print(f"❌ Error creating position notification: {e}")
             return False
     
-    def _send_email(self, subject: str, body: str) -> bool:
+    def _send_email(self, subject: str, body: str, attachment_path: Optional[str] = None) -> bool:
         """
-        Send email with given subject and body
+        Send email with given subject and body, optionally with attachment
         
         Args:
             subject: Email subject
             body: Email body
+            attachment_path: Optional path to file to attach
             
         Returns:
             True if successful, False otherwise
@@ -245,6 +248,30 @@ Trading Logic: Open when ALL 3 conditions met, Close when ≤1 condition remains
             # Add body
             msg.attach(MIMEText(body, 'plain'))
             
+            # Add attachment if provided
+            if attachment_path and os.path.exists(attachment_path):
+                try:
+                    with open(attachment_path, 'rb') as f:
+                        file_data = f.read()
+                        file_name = os.path.basename(attachment_path)
+                    
+                    # Create attachment using MIMEBase
+                    attachment = MIMEBase('application', 'octet-stream')
+                    attachment.set_payload(file_data)
+                    encoders.encode_base64(attachment)
+                    attachment.add_header(
+                        'Content-Disposition',
+                        f'attachment; filename= {file_name}'
+                    )
+                    msg.attach(attachment)
+                    
+                    print(f"📎 Attached file: {file_name}")
+                except Exception as e:
+                    print(f"⚠️ Failed to attach file {attachment_path}: {e}")
+                    # Continue sending email without attachment
+            elif attachment_path:
+                print(f"⚠️ Attachment file not found: {attachment_path}")
+            
             # Send email
             server = smtplib.SMTP(self.smtp_server, self.smtp_port)
             server.starttls()
@@ -253,7 +280,8 @@ Trading Logic: Open when ALL 3 conditions met, Close when ≤1 condition remains
             server.sendmail(self.sender, self.recipients, text)
             server.quit()
             
-            print(f"📧 Email sent successfully to {len(self.recipients)} recipients")
+            attachment_info = f" with attachment ({os.path.basename(attachment_path)})" if attachment_path and os.path.exists(attachment_path) else ""
+            print(f"📧 Email sent successfully to {len(self.recipients)} recipients{attachment_info}")
             return True
             
         except Exception as e:

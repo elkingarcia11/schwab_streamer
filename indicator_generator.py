@@ -94,10 +94,7 @@ class IndicatorGenerator:
                 ema_value = last_row['ema']
                 if not pd.isna(ema_value):
                     last_values['ema'] = ema_value
-                    print(f"📊 Loaded EMA value: {last_values['ema']}")
-                else:
-                    print(f"📊 EMA value is NaN")
-                    all_fields_loaded = False
+                print(f"📊 Loaded EMA value: {last_values['ema']}")
             else:
                 print(f"📊 No EMA column found")
                 all_fields_loaded = False
@@ -143,12 +140,9 @@ class IndicatorGenerator:
                     signal_value = last_row[macd_signal_col]
                     if not pd.isna(signal_value):
                         last_values['macd_signal_ema'] = signal_value
-                        last_values['macd_fast_ema'] = last_row['close']  # Approximation
-                        last_values['macd_slow_ema'] = last_row['close']  # Approximation
-                        print(f"📊 Loaded MACD signal value: {last_values['macd_signal_ema']}")
-                    else:
-                        print(f"📊 MACD signal value is NaN")
-                        all_fields_loaded = False
+                    last_values['macd_fast_ema'] = last_row['close']  # Approximation
+                    last_values['macd_slow_ema'] = last_row['close']  # Approximation
+                    print(f"📊 Loaded MACD signal value: {last_values['macd_signal_ema']}")
                 else:
                     print(f"📊 No MACD columns found")
                     all_fields_loaded = False
@@ -198,9 +192,32 @@ class IndicatorGenerator:
             self._update_last_values_from_dataframe(symbol, timeframe, new_df_with_indicators)
             return new_df_with_indicators, 0
         
-        # Check if any values in last_vals are None or empty
-        if any(value is None or (isinstance(value, list) and len(value) == 0) for value in last_vals.values()):
-            print(f"❌ Invalid state for {symbol} {timeframe}, generating all indicators from scratch")
+        # Check if critical values are None or empty (EMA and MACD signal are critical for incremental calculation)
+        ema_val = last_vals.get('ema')
+        macd_signal_val = last_vals.get('macd_signal_ema')
+        vwma_buffer = last_vals.get('vwma_buffer', [])
+        roc_buffer = last_vals.get('roc_buffer', [])
+        
+        # Helper function to check if a value is None or NaN
+        def is_none_or_nan(val):
+            if val is None:
+                return True
+            try:
+                return pd.isna(val)
+            except:
+                return False
+        
+        critical_missing = (
+            is_none_or_nan(ema_val) or
+            is_none_or_nan(macd_signal_val) or
+            not vwma_buffer or len(vwma_buffer) == 0 or
+            not roc_buffer or len(roc_buffer) == 0
+        )
+        
+        if critical_missing:
+            print(f"❌ Critical indicator state missing for {symbol} {timeframe}, generating all indicators from scratch")
+            print(f"   EMA: {last_vals.get('ema')}, MACD Signal: {last_vals.get('macd_signal_ema')}")
+            print(f"   VWMA buffer length: {len(last_vals.get('vwma_buffer', []))}, ROC buffer length: {len(last_vals.get('roc_buffer', []))}")
             # Combine df and new_df
             combined_df = pd.concat([df, new_df])
             combined_df_with_indicators = self.generate_indicators(symbol, timeframe, combined_df)
@@ -241,9 +258,10 @@ class IndicatorGenerator:
             slow_ema = self.periods[timeframe]['slow_ema']
             signal_ema = self.periods[timeframe]['signal_ema']
             
-            print(f"🔍 [DEBUG] Incremental calculation for {symbol} {timeframe}")
-            print(f"🔍 [DEBUG] New data points: {len(df)}")
-            print(f"🔍 [DEBUG] Stored buffers - VWMA: {len(last_vals.get('vwma_buffer', []))}, ROC: {len(last_vals.get('roc_buffer', []))}")
+            # Debug output only for streaming (not bootstrap)
+            # print(f"🔍 [DEBUG] Incremental calculation for {symbol} {timeframe}")
+            # print(f"🔍 [DEBUG] New data points: {len(df)}")
+            # print(f"🔍 [DEBUG] Stored buffers - VWMA: {len(last_vals.get('vwma_buffer', []))}, ROC: {len(last_vals.get('roc_buffer', []))}")
             
             # Pre-allocate result DataFrame with original data
             result_df = df.copy()
@@ -269,9 +287,10 @@ class IndicatorGenerator:
                     ema_values[i] = current_ema
                 
                 result_df['ema'] = ema_values
-                print(f"📊 Calculated incremental EMA for {num_rows} new rows")
+                # print(f"📊 Calculated incremental EMA for {num_rows} new rows")
             else:
-                print(f"📊 Cannot calculate EMA - missing previous EMA value")
+                pass
+                # print(f"📊 Cannot calculate EMA - missing previous EMA value")
             
             # Calculate VWMA incrementally (needs buffer of previous prices/volumes)
             if vwma_period and last_vals['vwma_buffer'] and len(last_vals['vwma_buffer']) > 0:
@@ -297,9 +316,10 @@ class IndicatorGenerator:
                     vwma_values[i] = vwma
                 
                 result_df['vwma'] = vwma_values
-                print(f"📊 Calculated incremental VWMA for {num_rows} new rows")
+                # print(f"📊 Calculated incremental VWMA for {num_rows} new rows")
             else:
-                print(f"📊 Cannot calculate VWMA - missing previous buffer")
+                pass
+                # print(f"📊 Cannot calculate VWMA - missing previous buffer")
             
             # Calculate ROC incrementally (needs buffer of previous prices)
             if roc_period and last_vals['roc_buffer'] and len(last_vals['roc_buffer']) > 0:
@@ -323,9 +343,10 @@ class IndicatorGenerator:
                     roc_values[i] = roc
                 
                 result_df['roc'] = roc_values
-                print(f"📊 Calculated incremental ROC for {num_rows} new rows")
+                # print(f"📊 Calculated incremental ROC for {num_rows} new rows")
             else:
-                print(f"📊 Cannot calculate ROC - missing previous buffer")
+                pass
+                # print(f"📊 Cannot calculate ROC - missing previous buffer")
             
             # Calculate MACD incrementally (needs previous EMA values)
             if (fast_ema and slow_ema and signal_ema and 
@@ -360,12 +381,13 @@ class IndicatorGenerator:
                 
                 result_df['macd_line'] = macd_line_values
                 result_df['macd_signal'] = macd_signal_values
-                print(f"📊 Calculated incremental MACD for {num_rows} new rows")
+                # print(f"📊 Calculated incremental MACD for {num_rows} new rows")
             else:
-                print(f"📊 Cannot calculate MACD - missing previous signal EMA")
+                pass
+                # print(f"📊 Cannot calculate MACD - missing previous signal EMA")
             
-            print(f"✅ Incrementally processed {symbol} {timeframe} with {num_rows} new rows")
-            print(f"🔍 [DEBUG] Result indicators - EMA: {result_df['ema'].iloc[-1] if not pd.isna(result_df['ema'].iloc[-1]) else 'NaN'}, VWMA: {result_df['vwma'].iloc[-1] if not pd.isna(result_df['vwma'].iloc[-1]) else 'NaN'}, ROC: {result_df['roc'].iloc[-1] if not pd.isna(result_df['roc'].iloc[-1]) else 'NaN'}")
+            # print(f"✅ Incrementally processed {symbol} {timeframe} with {num_rows} new rows")
+            # print(f"🔍 [DEBUG] Result indicators - EMA: {result_df['ema'].iloc[-1] if not pd.isna(result_df['ema'].iloc[-1]) else 'NaN'}, VWMA: {result_df['vwma'].iloc[-1] if not pd.isna(result_df['vwma'].iloc[-1]) else 'NaN'}, ROC: {result_df['roc'].iloc[-1] if not pd.isna(result_df['roc'].iloc[-1]) else 'NaN'}")
             return result_df
             
         except Exception as e:
@@ -499,10 +521,10 @@ class IndicatorGenerator:
                 new_cols['macd_line'] = macd_line
                 new_cols['macd_signal'] = macd_line.ewm(span=signal_ema, adjust=False).mean()
             
-            # Concatenate all new columns at once
-            new_cols_df = pd.DataFrame(new_cols)
-            result_df = pd.concat([df, new_cols_df], axis=1)
-            result_df = result_df.copy()  # Defragment
+            # Update DataFrame with indicator columns (replace if they already exist)
+            result_df = df.copy()
+            for col_name, col_data in new_cols.items():
+                result_df[col_name] = col_data
             
             print(f"✅ Bulk processed {symbol} {timeframe} with {len(result_df)} rows")
             
